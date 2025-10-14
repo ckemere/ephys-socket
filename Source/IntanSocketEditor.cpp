@@ -1,12 +1,12 @@
-#include "EphysSocketEditor.h"
-#include "EphysSocket.h"
+#include "IntanSocketEditor.h"
+#include "IntanSocket.h"
 
 #include <iostream>
 #include <string>
 
-using namespace EphysSocketNode;
+using namespace IntanSocketNode;
 
-EphysSocketEditor::EphysSocketEditor (GenericProcessor* parentNode, EphysSocket* socket) : GenericEditor (parentNode)
+IntanSocketEditor::IntanSocketEditor (GenericProcessor* parentNode, IntanSocket* socket) : GenericEditor (parentNode)
 {
     node = socket;
 
@@ -27,11 +27,11 @@ EphysSocketEditor::EphysSocketEditor (GenericProcessor* parentNode, EphysSocket*
     disconnectButton->addListener (this);
     addAndMakeVisible (disconnectButton.get());
     disconnectButton->setVisible (false);
-
-    addTextBoxParameterEditor (Parameter::PROCESSOR_SCOPE, "port", 10, 60);
-    addTextBoxParameterEditor (Parameter::PROCESSOR_SCOPE, "sample_rate", 10, 95);
-    addTextBoxParameterEditor (Parameter::PROCESSOR_SCOPE, "data_scale", 95, 60);
-    addTextBoxParameterEditor (Parameter::PROCESSOR_SCOPE, "data_offset", 95, 95);
+    
+    addTextBoxParameterEditor(Parameter::PROCESSOR_SCOPE, "device_ip", 10, 60);
+    addTextBoxParameterEditor(Parameter::PROCESSOR_SCOPE, "tcp_port", 10, 95);
+    addTextBoxParameterEditor(Parameter::PROCESSOR_SCOPE, "udp_port", 95, 60);
+    addTextBoxParameterEditor(Parameter::PROCESSOR_SCOPE, "data_scale", 95, 95);
 
     for (auto& ed : parameterEditors)
     {
@@ -40,44 +40,44 @@ EphysSocketEditor::EphysSocketEditor (GenericProcessor* parentNode, EphysSocket*
     }
 }
 
-void EphysSocketEditor::startAcquisition()
+void IntanSocketEditor::startAcquisition()
 {
     disconnectButton->setEnabled (false);
     disconnectButton->setAlpha (0.2f);
 }
 
-void EphysSocketEditor::stopAcquisition()
+void IntanSocketEditor::stopAcquisition()
 {
     if (node->errorFlag())
     {
-        node->disconnectSocket();
+        node->disconnectDevice();
     }
 
     disconnectButton->setEnabled (true);
     disconnectButton->setAlpha (1.0f);
 }
 
-void EphysSocketEditor::buttonClicked (Button* button)
+void IntanSocketEditor::buttonClicked (Button* button)
 {
     if (button == connectButton.get() && ! acquisitionIsActive)
     {
-        node->connectSocket();
+        node->connectDevice();
 
         CoreServices::updateSignalChain (this);
     }
     else if (button == disconnectButton.get() && ! acquisitionIsActive)
     {
-        node->disconnectSocket();
+        node->disconnectDevice();
     }
 }
 
-void EphysSocketEditor::connected()
+void IntanSocketEditor::connected()
 {
     connectButton->setVisible (false);
     disconnectButton->setVisible (true);
 }
 
-void EphysSocketEditor::disconnected()
+void IntanSocketEditor::disconnected()
 {
     connectButton->setVisible (true);
     disconnectButton->setVisible (false);

@@ -1,5 +1,5 @@
-#ifndef __EPHYSSOCKETEDITORH__
-#define __EPHYSSOCKETEDITORH__
+#ifndef __IntanSocketEditorH__
+#define __IntanSocketEditorH__
 
 #ifdef _WIN32
 #include <Windows.h>
@@ -7,18 +7,18 @@
 
 #include <VisualizerEditorHeaders.h>
 
-#include "EphysSocketHeader.h"
+#include "IntanSocket.h"
 
-namespace EphysSocketNode
+namespace IntanSocketNode
 {
-class EphysSocket;
+class IntanSocket;
 
-class EphysSocketEditor : public GenericEditor,
+class IntanSocketEditor : public GenericEditor,
                           public Button::Listener
 {
 public:
     /** Constructor */
-    EphysSocketEditor (GenericProcessor* parentNode, EphysSocket* node);
+    IntanSocketEditor (GenericProcessor* parentNode, IntanSocket* node);
 
     /** Button listener callback, called by button when pressed. */
     void buttonClicked (Button* button);
@@ -44,9 +44,9 @@ private:
     String stringDisconnect = "DISCONNECT";
 
     // Parent node
-    EphysSocket* node;
+    IntanSocket* node;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (EphysSocketEditor);
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (IntanSocketEditor);
 };
 } // namespace EphysSocketNode
 

@@ -59,6 +59,8 @@ if (NOT CMAKE_LIBRARY_ARCHITECTURE)
 	endif()
 endif()
 
+set_property(TARGET ${PLUGIN_NAME} PROPERTY CXX_STANDARD 17)
+
 #Libraries and compiler options
 if(MSVC)
 	target_link_libraries(${PLUGIN_NAME} ${GUI_BIN_DIR}/open-ephys.lib)
@@ -101,3 +103,19 @@ endforeach()
 #
 #target_link_libraries(${PLUGIN_NAME} ${LIBNAME_LIBRARIES})
 #target_include_directories(${PLUGIN_NAME} PRIVATE ${LIBNAME_INCLUDE_DIRS})
+# # IntanInterface library
+# set(INTAN_INTERFACE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../IntanInterface)
+
+# # Build IntanInterface as part of this project
+# add_subdirectory(${INTAN_INTERFACE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/IntanInterface)
+
+# # Include IntanInterface headers
+# target_include_directories(${PLUGIN_NAME} PRIVATE ${INTAN_INTERFACE_DIR})
+
+# # Link against IntanInterface
+# target_link_libraries(${PLUGIN_NAME} IntanInterface)
+
+# # Platform-specific network libraries (if not already included)
+# if(MSVC)
+# 	target_link_libraries(${PLUGIN_NAME} ws2_32)
+# endif()
