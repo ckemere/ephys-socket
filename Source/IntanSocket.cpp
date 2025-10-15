@@ -124,6 +124,16 @@ bool IntanSocket::connectDevice(bool printOutput)
             intanInterface.reset();
             return false;
         }
+
+        // CRITICAL: Configure channel enable BEFORE getting status
+        // Firmware defaults to 0x0, we want all 4 channels
+        if (!intanInterface->setChannelEnable(0x0F)) {
+            LOGE("Failed to set channel enable");
+            intanInterface.reset();
+            return false;
+        }
+        
+        Thread::sleep(100);  // Let it take effect
         
         // Set up data callback
         intanInterface->setDataCallback(
@@ -306,18 +316,6 @@ bool IntanSocket::startAcquisition()
         return false;
     }
     
-
-    // CRITICAL: Set channel enable explicitly (firmware defaults to 0x0)
-    if (!intanInterface->setChannelEnable(0x0F)) {
-        LOGE("Failed to set channel enable");
-        return false;
-    }
-    Thread::sleep(50);
-    
-    // Update num_channels to match what we just set
-    channel_enable_mask = 0x0F;
-    num_channels = calculateNumChannels(0x0F);  // Should be 140
-    
     // Resize buffers - ONE time sample per packet across all channels
     convbuf.resize(num_channels);      // 140 channels × 1 sample
     sampleNumbers.resize(1);           // 1 time sample
@@ -423,7 +421,26 @@ bool IntanSocket::updateBuffer()
     // Skip header (first 4 words: magic + timestamp)
     const uint32_t* dataWords = packet.data.data() + 4;
     size_t numDataWords = packet.data.size() - 4;
+
+
+    // Periodic logging (every 30000 samples = once per second at 30kHz)
+    static int64 logCounter = 0;
+    bool shouldLog = (totalSamples % 29000 == 0);
     
+    if (shouldLog) {
+        LOGC("=== PACKET DEBUG (sample ", totalSamples, ") ===");
+        LOGC("Total packet words: ", packet.data.size());
+        LOGC("Data words (after header): ", numDataWords);
+        LOGC("num_channels: ", num_channels);
+        LOGC("channel_enable_mask: 0x", String::toHexString(channel_enable_mask));
+        
+        // Show first few raw data words
+        LOGC("First 8 data words (hex):");
+        for (size_t i = 0; i < std::min(size_t(8), numDataWords); ++i) {
+            LOGC("  Word ", i, ": 0x", String::toHexString((int)dataWords[i]));
+        }
+    }
+
     // Each packet contains ONE time sample for each channel
     // Data is packed as 16-bit signed integers in 32-bit words
     
