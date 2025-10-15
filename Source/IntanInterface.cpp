@@ -416,7 +416,7 @@ private:
                 
                 // Configure device to send UDP to us
                 uint32_t ipInt = stringToIp(localIp);
-                sendCommand(CMD_SET_UDP_DEST, (ipInt), udpPort_);
+                sendCommand(CMD_SET_UDP_DEST, ntohl(ipInt), udpPort_);
             }
         }
         
@@ -652,7 +652,7 @@ bool IntanInterface::setUdpDestination(const std::string& ipAddress, uint16_t po
     if (ipInt == 0) {
         return false;
     }
-    return pImpl_->sendCommand(CMD_SET_UDP_DEST, (ipInt), port);
+    return pImpl_->sendCommand(CMD_SET_UDP_DEST, ntohl(ipInt), port);
 }
 
 bool IntanInterface::loadConvertSequence() {

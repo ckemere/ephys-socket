@@ -217,23 +217,23 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     sourceStreams->add(new DataStream(settings));
     
     // Calculate total channels based on channel_enable_mask
-    // Each bit enables 32 channels:
-    // Bit 0: channels 0-31
-    // Bit 1: channels 32-63
-    // Bit 2: channels 64-95
-    // Bit 3: channels 96-127
+    // Each bit enables 35 channels:
+    // Bit 0: channels 0-34
+    // Bit 1: channels 35-69
+    // Bit 2: channels 70-104
+    // Bit 3: channels 105-140
     
     num_channels = 0;
     for (int i = 0; i < 4; ++i)
     {
         if (channel_enable_mask & (1 << i))
-            num_channels += 32;
+            num_channels += 35;
     }
     
     if (num_channels == 0)
     {
         LOGE("No channels enabled!");
-        num_channels = 32; // Fallback
+        num_channels = 35; // Fallback
     }
     
     // Resize buffer
@@ -306,12 +306,24 @@ bool IntanSocket::startAcquisition()
         return false;
     }
     
-    // Resize buffers
-    convbuf.resize(num_channels * 35);  // 35 samples per packet
-    sampleNumbers.resize(35);
+
+    // CRITICAL: Set channel enable explicitly (firmware defaults to 0x0)
+    if (!intanInterface->setChannelEnable(0x0F)) {
+        LOGE("Failed to set channel enable");
+        return false;
+    }
+    Thread::sleep(50);
+    
+    // Update num_channels to match what we just set
+    channel_enable_mask = 0x0F;
+    num_channels = calculateNumChannels(0x0F);  // Should be 140
+    
+    // Resize buffers - ONE time sample per packet across all channels
+    convbuf.resize(num_channels);      // 140 channels × 1 sample
+    sampleNumbers.resize(1);           // 1 time sample
     timestamps.clear();
-    timestamps.insertMultiple(0, 0.0, 35);
-    ttlEventWords.resize(35);
+    timestamps.insertMultiple(0, 0.0, 1);  // 1 timestamp
+    ttlEventWords.resize(1);           // 1 TTL word
     
     totalSamples = 0;
     eventState = 0;
@@ -338,6 +350,14 @@ bool IntanSocket::startAcquisition()
         return false;
     }
     
+    Thread::sleep(100);  // Wait for initialization
+    
+    if (!intanInterface->setDebugMode(true))
+    {
+        LOGE("Failed to set debug mode.");
+        return false;
+    }
+
     // Start acquisition on device
     if (!intanInterface->startAcquisition())
     {
