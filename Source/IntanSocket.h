@@ -2,7 +2,7 @@
 #define __INTANSOCKETH__
 
 #include <DataThreadHeaders.h>
-#include "IntanInterface.h"  // Our library!
+#include "IntanInterface.h"
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -16,7 +16,7 @@ public:
     const String DEFAULT_DEVICE_IP = "192.168.18.10";
     const int DEFAULT_TCP_PORT = 6000;
     const int DEFAULT_UDP_PORT = 5000;
-    const float SAMPLE_RATE = 30000.0f; // Fixed for Intan
+    const float SAMPLE_RATE = 30000.0f; // Fixed for now
     const float DEFAULT_DATA_SCALE = 0.195f;    // Intan µV per bit
     
     /** Parameter limits */
@@ -31,7 +31,7 @@ public:
     int udp_port;
     float data_scale;
 
-    int num_channels;  // Effective number of channels based on channel_enable
+    int num_channels;
     uint8_t channel_enable_mask;
 
     /** Constructor */
@@ -71,6 +71,12 @@ public:
 
     /** Returns if any errors occurred */
     bool errorFlag();
+    
+    /** Run auto-detection of connected chips */
+    bool runAutoDetection(IntanInterface::AutoDetectionResult& result, bool verbose = false);
+    
+    /** Apply auto-detection configuration */
+    bool applyDetectionConfig(const IntanInterface::AutoDetectionResult& result);
 
     
 private:

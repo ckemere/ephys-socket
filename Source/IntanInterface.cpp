@@ -703,6 +703,15 @@ public:
     // ========================================================================
     
     bool initializeForDetection(bool verbose) {
+        // Disable debug mode to read real chip data
+        if (!sendCommand(CMD_SET_DEBUG_MODE, 0)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Failed to disable debug mode" << std::endl;
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
         // Set loop count to 1 for single-packet acquisitions
         if (!sendCommand(CMD_SET_LOOP_COUNT, 1)) {
             if (verbose) {

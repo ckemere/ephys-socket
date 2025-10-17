@@ -348,13 +348,21 @@ bool IntanSocket::startAcquisition()
         return false;
     }
     
-    Thread::sleep(100);  // Wait for initialization
+    // Thread::sleep(100);  // Wait for initialization
     
-    if (!intanInterface->setDebugMode(true))
+    // if (!intanInterface->setDebugMode(true))
+    // {
+    //     LOGE("Failed to set debug mode.");
+    //     return false;
+    // }
+ 
+
+    if (!intanInterface->setLoopCount(0)) // Loop count 0 for infinite streaming
     {
-        LOGE("Failed to set debug mode.");
+        LOGE("Failed to set loop count to infinite");
         return false;
     }
+    Thread::sleep(10);    
 
     // Start acquisition on device
     if (!intanInterface->startAcquisition())
@@ -478,6 +486,48 @@ bool IntanSocket::updateBuffer()
                                    timestamps.getRawDataPointer(),
                                    ttlEventWords.getRawDataPointer(),
                                    1);  // ONE time sample
+    
+    return true;
+}
+
+bool IntanSocket::runAutoDetection(IntanInterface::AutoDetectionResult& result, bool verbose)
+{
+    if (!intanInterface || !intanInterface->isReady())
+    {
+        LOGE("Cannot run auto-detection - device not ready");
+        return false;
+    }
+    
+    // Run detection
+    bool success = intanInterface->runAutoDetection(result, verbose);
+    
+    if (success && result.success)
+    {
+        LOGC("Auto-detection complete: ", result.getChannelSummary().c_str());
+    }
+    
+    return success;
+}
+
+bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult& result)
+{
+    if (!intanInterface || !result.success)
+    {
+        return false;
+    }
+    
+    // Apply configuration from detection
+    if (!intanInterface->applyDetectionConfig(result))
+    {
+        LOGE("Failed to apply detection configuration");
+        return false;
+    }
+    
+    // Update local channel enable state
+    channel_enable_mask = result.optimalChannelMask;
+    num_channels = calculateNumChannels(channel_enable_mask);
+    
+    LOGC("Applied detection config - ", num_channels, " channels enabled");
     
     return true;
 }
