@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include <sstream>
 
 /**
  * @brief C++ API for Zynq-based Intan neural recording interface
@@ -20,7 +21,17 @@
  *   IntanInterface intan("192.168.18.10");
  *   
  *   if (intan.foundInputSource() && intan.isReady()) {
- *       intan.setDataCallback([](const uint32_t* data, size_t words, uint64_t ts) {
+  *       // Run auto-detection
+ *       IntanInterface::AutoDetectionResult result;
+ *       if (intan.runAutoDetection(result, true)) {
+ *           std::cout << result.getSummary() << std::endl;
+ *           
+ *           if (result.success) {
+ *               intan.applyDetectionConfig(result);
+ *           }
+ *       }
+ *       
+*       intan.setDataCallback([](const uint32_t* data, size_t words, uint64_t ts) {
  *           // Process data packet
  *       });
  *       
@@ -36,6 +47,15 @@
  */
 class IntanInterface {
 public:
+    /**
+     * @brief Chip type identification
+     */
+    enum class ChipType {
+        NONE,
+        RHD2132,  // 32-channel, no DDR
+        RHD2164   // 64-channel, with DDR
+    };
+
     /**
      * @brief Device status information
      */
@@ -108,6 +128,62 @@ public:
         uint64_t lastTimestamp;
     };
     
+    /**
+     * @brief Result from testing a single phase setting
+     */
+    struct PhaseTestResult {
+        uint8_t phase;
+        double cipo0Score;
+        double cipo1Score;
+        bool cipo0HasDdr;
+        bool cipo1HasDdr;
+        ChipType cipo0ChipType;
+        ChipType cipo1ChipType;
+    };
+    
+    /**
+     * @brief Complete auto-detection results
+     */
+    struct AutoDetectionResult {
+        bool success;
+        bool chipsDetected;
+        
+        // Best configuration
+        uint8_t bestPhase0;
+        uint8_t bestPhase1;
+        uint8_t optimalChannelMask;
+        
+        // CIPO0 detection
+        bool cipo0Detected;
+        ChipType cipo0ChipType;
+        bool cipo0HasDdr;
+        double cipo0Score;
+        
+        // CIPO1 detection
+        bool cipo1Detected;
+        ChipType cipo1ChipType;
+        bool cipo1HasDdr;
+        double cipo1Score;
+        
+        // All phase test results
+        std::vector<PhaseTestResult> allPhaseResults;
+        
+        /**
+         * @brief Get chip type as string
+         */
+        static std::string chipTypeToString(ChipType type);
+        
+        /**
+         * @brief Get human-readable summary
+         */
+        std::string getSummary() const;
+        
+        /**
+         * @brief Get detailed channel summary
+         */
+        std::string getChannelSummary() const;
+    };
+        
     /**
      * @brief Callback type for receiving data packets
      * 
@@ -182,6 +258,41 @@ public:
      * @param stats Output parameter filled with reception stats
      */
     void getReceptionStats(ReceptionStats& stats) const;
+    
+    // ========================================================================
+    // AUTO-DETECTION
+    // ========================================================================
+    
+    /**
+     * @brief Run automated chip detection and cable phase optimization
+     * 
+     * This function:
+     * 1. Initializes the Intan chips
+     * 2. Loads the cable test sequence
+     * 3. Tests all 16 phase delay settings (0-15)
+     * 4. Scores each phase based on INTAN pattern detection
+     * 5. Identifies chip types (RHD2132 vs RHD2164)
+     * 6. Determines optimal channel enable mask
+     * 
+     * The device must be in a stopped state (not transmitting) before calling.
+     * 
+     * @param result Output parameter filled with detection results
+     * @param verbose If true, prints progress information to stdout
+     * @return true if detection completed (check result.success for chip detection)
+     */
+    bool runAutoDetection(AutoDetectionResult& result, bool verbose = false);
+    
+    /**
+     * @brief Apply configuration from auto-detection results
+     * 
+     * Sets the phase delays and channel enable mask based on detection results.
+     * Also loads the normal conversion sequence (not cable test).
+     * Does not start acquisition - call startAcquisition() separately.
+     * 
+     * @param result Detection results from runAutoDetection()
+     * @return true if configuration was applied successfully
+     */
+    bool applyDetectionConfig(const AutoDetectionResult& result);
     
     // ========================================================================
     // ACQUISITION CONTROL

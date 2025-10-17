@@ -63,6 +63,22 @@ namespace {
     
     // Packet header
     constexpr size_t PACKET_HEADER_WORDS = 4;
+    
+    // Auto-detection constants
+    constexpr uint16_t INTAN_PATTERN[] = {0x0049, 0x004E, 0x0054, 0x0041, 0x004E};  // 'I','N','T','A','N'
+    constexpr size_t INTAN_PATTERN_SIZE = 5;
+    
+    constexpr uint16_t CHIP_ID_RHD2164 = 4;  // 64-channel with DDR
+    constexpr uint16_t CHIP_ID_RHD2132 = 1;  // 32-channel without DDR
+    constexpr uint16_t CHIP_ID_RHD2216 = 2;  // 16-channel
+    
+    constexpr uint16_t MISO_REG_DDR = 0x35;     // Regular word when DDR available
+    constexpr uint16_t MISO_DDR_DDR = 0x3A;     // DDR word when DDR available
+    constexpr uint16_t MISO_NO_DDR = 0x00;      // When no DDR
+    
+    constexpr size_t CABLE_TEST_PACKET_SIZE_WORDS = 74;
+    constexpr double DETECTION_THRESHOLD = 60.0;
+    constexpr int NUM_PHASES_TO_TEST = 16;
 }
 
 // ============================================================================
@@ -124,6 +140,8 @@ public:
         , lastTimestamp_(0)
         , lastStatsTime_(std::chrono::steady_clock::now())
         , lastPacketCount_(0)
+        , captureForDetection_(false)
+        , maxDetectionQueueSize_(20)
     {
 #ifdef _WIN32
         WSADATA wsaData;
@@ -363,7 +381,128 @@ public:
     uint16_t getTcpPort() const { return tcpPort_; }
     uint16_t getUdpPort() const { return udpPort_; }
     
-private:
+    // ========================================================================
+    // AUTO-DETECTION METHODS
+    // ========================================================================
+    
+    bool runAutoDetection(AutoDetectionResult& result, bool verbose) {
+        // Initialize result
+        result.success = false;
+        result.chipsDetected = false;
+        result.bestPhase0 = 0;
+        result.bestPhase1 = 0;
+        result.optimalChannelMask = 0;
+        result.cipo0Detected = false;
+        result.cipo1Detected = false;
+        result.cipo0HasDdr = false;
+        result.cipo1HasDdr = false;
+        result.cipo0ChipType = ChipType::NONE;
+        result.cipo1ChipType = ChipType::NONE;
+        result.cipo0Score = 0.0;
+        result.cipo1Score = 0.0;
+        result.allPhaseResults.clear();
+        
+        if (verbose) {
+            std::cout << "[Detection] Starting automated chip detection..." << std::endl;
+        }
+        
+        // Check device is ready (not transmitting)
+        DeviceStatus status;
+        if (!getStatusInternal(status)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Cannot read device status" << std::endl;
+            }
+            return false;
+        }
+        
+        if (status.transmissionActive) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Device is transmitting. Stop acquisition first." << std::endl;
+            }
+            return false;
+        }
+        
+        // Initialize chips and load cable test sequence
+        if (!initializeForDetection(verbose)) {
+            return false;
+        }
+        
+        // Test all phases
+        double bestScore = -1000.0;
+        
+        for (int phase = 0; phase < NUM_PHASES_TO_TEST; ++phase) {
+            if (verbose) {
+                std::cout << "[Detection] Testing phase " << phase << "..." << std::endl;
+            }
+            
+            PhaseTestResult phaseResult = testPhase(phase, verbose);
+            result.allPhaseResults.push_back(phaseResult);
+            
+            // Check if either channel is valid (score > threshold)
+            bool cipo0Valid = phaseResult.cipo0Score > DETECTION_THRESHOLD;
+            bool cipo1Valid = phaseResult.cipo1Score > DETECTION_THRESHOLD;
+            
+            if (cipo0Valid || cipo1Valid) {
+                double totalScore = phaseResult.cipo0Score + phaseResult.cipo1Score;
+                
+                if (verbose && totalScore > 0) {
+                    std::cout << "  Phase " << phase 
+                             << ": CIPO0=" << phaseResult.cipo0Score
+                             << ", CIPO1=" << phaseResult.cipo1Score << std::endl;
+                }
+                
+                if (totalScore > bestScore) {
+                    bestScore = totalScore;
+                    result.bestPhase0 = phase;
+                    result.bestPhase1 = phase;  // Use same phase for both
+                    result.cipo0Detected = cipo0Valid;
+                    result.cipo1Detected = cipo1Valid;
+                    result.cipo0HasDdr = phaseResult.cipo0HasDdr;
+                    result.cipo1HasDdr = phaseResult.cipo1HasDdr;
+                    result.cipo0ChipType = phaseResult.cipo0ChipType;
+                    result.cipo1ChipType = phaseResult.cipo1ChipType;
+                    result.cipo0Score = phaseResult.cipo0Score;
+                    result.cipo1Score = phaseResult.cipo1Score;
+                }
+            }
+        }
+        
+        // Calculate optimal channel mask
+        result.chipsDetected = result.cipo0Detected || result.cipo1Detected;
+        result.success = result.chipsDetected;
+        
+        if (result.success) {
+            result.optimalChannelMask = 0;
+            
+            if (result.cipo0Detected) {
+                result.optimalChannelMask |= 0x01;  // CIPO0 regular
+                if (result.cipo0HasDdr) {
+                    result.optimalChannelMask |= 0x02;  // CIPO0 DDR
+                }
+            }
+            
+            if (result.cipo1Detected) {
+                result.optimalChannelMask |= 0x04;  // CIPO1 regular
+                if (result.cipo1HasDdr) {
+                    result.optimalChannelMask |= 0x08;  // CIPO1 DDR
+                }
+            }
+            
+            if (verbose) {
+                std::cout << "[Detection] Complete! Best phase: " 
+                         << static_cast<int>(result.bestPhase0) << std::endl;
+                std::cout << "[Detection] " << result.getChannelSummary() << std::endl;
+            }
+        } else {
+            if (verbose) {
+                std::cout << "[Detection] No chips detected" << std::endl;
+            }
+        }
+        
+        return true;
+    }
+    
+    private:
     bool connectTcp() {
         tcpSocket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (tcpSocket_ == INVALID_SOCKET) {
@@ -529,6 +668,14 @@ private:
             lastPacketCount_ = totalPackets_;
         }
         
+        // If capturing for detection, save packet
+        if (captureForDetection_.load()) {
+            std::lock_guard<std::mutex> detLock(detectionMutex_);
+            if (detectionPacketQueue_.size() < maxDetectionQueueSize_) {
+                detectionPacketQueue_.push(words);
+            }
+        }
+
         // Dispatch to callback (without holding stats lock)
         DataCallback callback;
         {
@@ -549,6 +696,262 @@ private:
         if (errorCallback_) {
             errorCallback_(message);
         }
+    }
+    
+    // ========================================================================
+    // AUTO-DETECTION HELPER METHODS
+    // ========================================================================
+    
+    bool initializeForDetection(bool verbose) {
+        // Set loop count to 1 for single-packet acquisitions
+        if (!sendCommand(CMD_SET_LOOP_COUNT, 1)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Failed to set loop count" << std::endl;
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        // Set channel enable to all channels for cable test
+        if (!sendCommand(CMD_SET_CHANNEL_ENABLE, 0x0F)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Failed to set channel enable" << std::endl;
+            }
+            return false;
+        }
+        updateChannelEnable(0x0F);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        // Load and run initialization sequence
+        if (verbose) {
+            std::cout << "[Detection] Running initialization sequence..." << std::endl;
+        }
+        
+        if (!sendCommand(CMD_LOAD_INIT)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Failed to load init sequence" << std::endl;
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        // Run initialization (acquire 1 packet)
+        if (!sendCommand(CMD_START)) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!sendCommand(CMD_STOP)) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        // Load cable test sequence
+        if (verbose) {
+            std::cout << "[Detection] Loading cable test sequence..." << std::endl;
+        }
+        
+        if (!sendCommand(CMD_LOAD_CABLE_TEST)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Failed to load cable test sequence" << std::endl;
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        return true;
+    }
+    
+    PhaseTestResult testPhase(uint8_t phase, bool verbose) {
+        PhaseTestResult result;
+        result.phase = phase;
+        result.cipo0Score = 0.0;
+        result.cipo1Score = 0.0;
+        result.cipo0HasDdr = false;
+        result.cipo1HasDdr = false;
+        result.cipo0ChipType = ChipType::NONE;
+        result.cipo1ChipType = ChipType::NONE;
+        
+        // Set phase
+        if (!sendCommand(CMD_SET_PHASE, phase, phase)) {
+            return result;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        // Start capture
+        startDetectionCapture();
+        
+        // Acquire packet
+        if (!sendCommand(CMD_START)) {
+            stopDetectionCapture();
+            return result;
+        }
+        
+        // Wait and capture packet
+        std::vector<uint32_t> packet;
+        bool captured = capturePacketForDetection(packet, 2.0);
+        
+        // Stop acquisition
+        sendCommand(CMD_STOP);
+        stopDetectionCapture();
+        
+        if (!captured) {
+            if (verbose) {
+                std::cout << "  Phase " << phase << ": No packet received" << std::endl;
+            }
+            return result;
+        }
+        
+        // Score both channels
+        auto [cipo0Score, cipo0Type] = scoreChannel(packet, 0, verbose);
+        auto [cipo1Score, cipo1Type] = scoreChannel(packet, 1, verbose);
+        
+        result.cipo0Score = cipo0Score;
+        result.cipo1Score = cipo1Score;
+        result.cipo0ChipType = cipo0Type;
+        result.cipo1ChipType = cipo1Type;
+        result.cipo0HasDdr = (cipo0Type == ChipType::RHD2164);
+        result.cipo1HasDdr = (cipo1Type == ChipType::RHD2164);
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        
+        return result;
+    }
+    
+    std::pair<double, ChipType> scoreChannel(
+        const std::vector<uint32_t>& packet, int channel, bool verbose) {
+        
+        if (packet.size() < CABLE_TEST_PACKET_SIZE_WORDS) {
+            return {0.0, ChipType::NONE};
+        }
+        
+        double score = 0.0;
+        ChipType chipType = ChipType::NONE;
+        
+        // Extract data words (skip 4-word header)
+        std::vector<uint32_t> dataWords(packet.begin() + 4, packet.end());
+        
+        if (dataWords.size() < 35) {
+            return {0.0, ChipType::NONE};
+        }
+        
+        // Extract this channel's words (every other word starting at channel offset)
+        std::vector<uint32_t> channelWords;
+        for (size_t i = channel; i < dataWords.size() && i < 70; i += 2) {
+            channelWords.push_back(dataWords[i]);
+        }
+        
+        if (channelWords.size() < 9) {
+            return {0.0, ChipType::NONE};
+        }
+        
+        // Extract regular and DDR streams from 32-bit words
+        std::vector<uint16_t> regular, ddr;
+        for (uint32_t word : channelWords) {
+            regular.push_back(word & 0xFFFF);           // Lower 16 bits
+            ddr.push_back((word >> 16) & 0xFFFF);       // Upper 16 bits
+        }
+        
+        // Score INTAN pattern (indices 2-6 due to 2-cycle pipeline delay)
+        std::vector<uint16_t> intanFound;
+        for (size_t i = 0; i < INTAN_PATTERN_SIZE; ++i) {
+            size_t idx = i + 2;  // Pipeline delay
+            if (idx < regular.size()) {
+                intanFound.push_back(regular[idx]);
+                if (regular[idx] == INTAN_PATTERN[i]) {
+                    score += 10.0;
+                }
+            }
+        }
+        
+        // Check chip ID at index 7
+        if (regular.size() > 7 && ddr.size() > 7) {
+            uint16_t chipIdReg = regular[7];
+            uint16_t chipIdDdr = ddr[7];
+            
+            // Both regular and DDR should read same chip ID
+            if (chipIdReg == CHIP_ID_RHD2164 && chipIdDdr == CHIP_ID_RHD2164) {
+                chipType = ChipType::RHD2164;
+                score += 10.0;
+            } else if (chipIdReg == CHIP_ID_RHD2132) {
+                chipType = ChipType::RHD2132;
+                score += 10.0;
+            } else if (chipIdReg == CHIP_ID_RHD2216) {
+                chipType = ChipType::RHD2132;  // Treat as RHD2132 (no DDR)
+                score += 10.0;
+            }
+        }
+        
+        // Check MISO register at index 8
+        if (regular.size() > 8 && ddr.size() > 8) {
+            uint16_t misoReg = regular[8];
+            uint16_t misoDdr = ddr[8];
+            
+            if (chipType == ChipType::RHD2164) {
+                // RHD2164 should have specific MISO values
+                if (misoReg == MISO_REG_DDR && misoDdr == MISO_DDR_DDR) {
+                    score += 10.0;
+                }
+            } else if (chipType == ChipType::RHD2132) {
+                // RHD2132 should have zero MISO
+                if (misoReg == MISO_NO_DDR) {
+                    score += 10.0;
+                }
+            }
+        }
+        
+        // Verbose output
+        if (verbose && score > DETECTION_THRESHOLD) {
+            std::string patternStr;
+            for (uint16_t val : intanFound) {
+                if (val >= 0x20 && val <= 0x7E) {
+                    patternStr += static_cast<char>(val);
+                } else {
+                    patternStr += '?';
+                }
+            }
+            
+            std::string chipStr = (chipType == ChipType::RHD2164) ? "RHD2164" : 
+                                 (chipType == ChipType::RHD2132) ? "RHD2132" : "Unknown";
+            
+            std::cout << "    CIPO" << channel << ": '" << patternStr 
+                     << "' (" << chipStr << ")" << std::endl;
+        }
+        
+        return {score, chipType};
+    }
+    
+    void startDetectionCapture() {
+        std::lock_guard<std::mutex> lock(detectionMutex_);
+        // Clear queue
+        while (!detectionPacketQueue_.empty()) {
+            detectionPacketQueue_.pop();
+        }
+        captureForDetection_ = true;
+    }
+    
+    void stopDetectionCapture() {
+        captureForDetection_ = false;
+    }
+    
+    bool capturePacketForDetection(
+        std::vector<uint32_t>& packet, double timeoutSec) {
+        
+        auto deadline = std::chrono::steady_clock::now() + 
+                       std::chrono::milliseconds(static_cast<int>(timeoutSec * 1000));
+        
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lock(detectionMutex_);
+                if (!detectionPacketQueue_.empty()) {
+                    packet = detectionPacketQueue_.front();
+                    detectionPacketQueue_.pop();
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        
+        return false;
     }
     
     // Configuration
@@ -586,6 +989,12 @@ private:
     // Callbacks
     DataCallback dataCallback_;
     ErrorCallback errorCallback_;
+    
+    // Auto-detection
+    std::mutex detectionMutex_;
+    std::queue<std::vector<uint32_t>> detectionPacketQueue_;
+    std::atomic<bool> captureForDetection_;
+    size_t maxDetectionQueueSize_;
 };
 
 // ============================================================================
@@ -679,6 +1088,33 @@ void IntanInterface::setErrorCallback(ErrorCallback callback) {
     pImpl_->setErrorCallback(callback);
 }
 
+bool IntanInterface::runAutoDetection(AutoDetectionResult& result, bool verbose) {
+    return pImpl_->runAutoDetection(result, verbose);
+}
+
+bool IntanInterface::applyDetectionConfig(const AutoDetectionResult& result) {
+    if (!result.success) {
+        return false;
+    }
+    
+    // Set phase delays
+    if (!setPhaseSelect(result.bestPhase0, result.bestPhase1)) {
+        return false;
+    }
+    
+    // Set channel enable mask
+    if (!setChannelEnable(result.optimalChannelMask)) {
+        return false;
+    }
+    
+    // Load normal conversion sequence (not cable test)
+    if (!loadConvertSequence()) {
+        return false;
+    }
+    
+    return true;
+}
+
 uint32_t IntanInterface::calculatePacketSize(uint8_t channelMask) {
     int numChannels = 0;
     for (int i = 0; i < 4; ++i) {
@@ -749,3 +1185,83 @@ std::string IntanInterface::DeviceStatus::getChannelEnableString() const {
     
     return first ? "NONE" : oss.str();
 }
+
+// ============================================================================
+// HELPER METHODS FOR AUTO-DETECTION RESULT
+// ============================================================================
+
+std::string IntanInterface::AutoDetectionResult::chipTypeToString(ChipType type) {
+    switch (type) {
+        case ChipType::RHD2132: return "RHD2132";
+        case ChipType::RHD2164: return "RHD2164";
+        case ChipType::NONE:
+        default: return "None";
+    }
+}
+
+std::string IntanInterface::AutoDetectionResult::getSummary() const {
+    if (!success) {
+        return "Detection failed. Check connections and try manual configuration.";
+    }
+    
+    if (!chipsDetected) {
+        return "No Intan chips detected. Verify:\n"
+               "  - SPI cable connections\n"
+               "  - Chip power supply\n"
+               "  - Cable integrity";
+    }
+    
+    std::ostringstream oss;
+    oss << "Chips detected!\n";
+    oss << "  Best Phase: " << static_cast<int>(bestPhase0);
+    if (bestPhase0 != bestPhase1) {
+        oss << " (Phase0), " << static_cast<int>(bestPhase1) << " (Phase1)";
+    }
+    oss << "\n";
+    oss << "  Channel Mask: 0x" << std::hex << std::uppercase 
+        << static_cast<int>(optimalChannelMask) << std::dec << "\n";
+    
+    if (cipo0Detected) {
+        oss << "  CIPO0: " << chipTypeToString(cipo0ChipType) << "\n";
+    }
+    
+    if (cipo1Detected) {
+        oss << "  CIPO1: " << chipTypeToString(cipo1ChipType) << "\n";
+    }
+    
+    double bestScore = cipo0Score + cipo1Score;
+    std::string confidence = (bestScore > 100) ? "High" : "Medium";
+    oss << "  Detection Confidence: " << confidence;
+    
+    return oss.str();
+}
+
+std::string IntanInterface::AutoDetectionResult::getChannelSummary() const {
+    if (!chipsDetected) {
+        return "No chips detected";
+    }
+    
+    std::vector<std::string> channels;
+    if (cipo0Detected) {
+        std::string desc = "CIPO0 (" + chipTypeToString(cipo0ChipType) + ")";
+        channels.push_back(desc);
+    }
+    
+    if (cipo1Detected) {
+        std::string desc = "CIPO1 (" + chipTypeToString(cipo1ChipType) + ")";
+        channels.push_back(desc);
+    }
+    
+    if (channels.empty()) {
+        return "No active channels";
+    }
+    
+    std::ostringstream oss;
+    oss << "Active channels: ";
+    for (size_t i = 0; i < channels.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << channels[i];
+    }
+    return oss.str();
+}
+
