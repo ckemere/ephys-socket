@@ -445,7 +445,7 @@ bool IntanSocket::updateBuffer()
         // Show first few raw data words
         LOGC("First 8 data words (hex):");
         for (size_t i = 0; i < std::min(size_t(8), numDataWords); ++i) {
-            LOGC("  Word ", i, ": 0x", String::toHexString((int)dataWords[i]));
+            LOGC("  Word ", i, ": 0x", String::toHexString(dataWords[i]));
         }
     }
 
@@ -462,7 +462,7 @@ bool IntanSocket::updateBuffer()
         
         if (wordIdx < numDataWords)
         {
-            int16_t sample;
+            uint16_t sample;
             if (halfIdx == 0)
                 sample = (uint16_t)(dataWords[wordIdx] & 0xFFFF);  // Low 16 bits
             else
