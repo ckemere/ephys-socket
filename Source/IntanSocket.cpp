@@ -464,11 +464,11 @@ bool IntanSocket::updateBuffer()
         {
             int16_t sample;
             if (halfIdx == 0)
-                sample = (int16_t)(dataWords[wordIdx] & 0xFFFF);  // Low 16 bits
+                sample = (uint16_t)(dataWords[wordIdx] & 0xFFFF);  // Low 16 bits
             else
-                sample = (int16_t)((dataWords[wordIdx] >> 16) & 0xFFFF);  // High 16 bits
+                sample = (uint16_t)((dataWords[wordIdx] >> 16) & 0xFFFF);  // High 16 bits
             
-            convbuf[ch] = (float)sample;
+            convbuf[ch] = (float)(sample - 32768);
         }
         else
         {
