@@ -103,6 +103,8 @@ private:
     std::unique_ptr<UtilityButton> connectButton;
     std::unique_ptr<UtilityButton> disconnectButton;
     std::unique_ptr<UtilityButton> rescanButton;
+    std::unique_ptr<UtilityButton> debugModeButton;
+    bool debugModeActive;  // Track debug mode state
     
     // UI components
     std::unique_ptr<ChipInterface> cipo0Interface;

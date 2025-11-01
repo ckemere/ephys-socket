@@ -20,6 +20,7 @@ IntanSocket::IntanSocket(SourceNode* sn)
     totalSamples = 0;
     eventState = 0;
     hasError = false;
+    debugMode = false;
 
     // Create IntanInterface (will throw if can't connect, so wrap in try)
     intanInterface = nullptr;
@@ -426,9 +427,9 @@ bool IntanSocket::updateBuffer()
         dataQueue.pop();
     }
     
-    // Skip header (first 4 words: magic + timestamp)
-    const uint32_t* dataWords = packet.data.data() + 4;
-    size_t numDataWords = packet.data.size() - 4;
+    // Skip header (first 10 words: magic + timestamp)
+    const uint32_t* dataWords = packet.data.data() + 10;
+    size_t numDataWords = packet.data.size() - 10;
 
 
     // Periodic logging (every 30000 samples = once per second at 30kHz)
@@ -530,4 +531,137 @@ bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult
     LOGC("Applied detection config - ", num_channels, " channels enabled");
     
     return true;
+}
+void IntanSocket::setDebugMode(bool enable)
+{
+    debugMode = enable;
+    
+    if (debugMode)
+    {
+        // ====================================================================
+        // ENABLE DEBUG MODE
+        // ====================================================================
+        
+        LOGC("Enabling debug mode - simulating 128 channels (2x64)");
+        
+        // Check if we have a connection to the hardware
+        if (!intanInterface || !intanInterface->isReady())
+        {
+            LOGE("Cannot enable debug mode - device not ready");
+            CoreServices::sendStatusMessage("Intan: Debug mode failed - device not connected");
+            debugMode = false;
+            return;
+        }
+        
+        // Step 1: Send hardware debug mode enable command (0x12 SET_DEBUG_MODE)
+        if (!intanInterface->setDebugMode(true))
+        {
+            LOGE("Failed to send debug mode enable command to hardware");
+            CoreServices::sendStatusMessage("Intan: Failed to enable hardware debug mode");
+            debugMode = false;
+            return;
+        }
+        
+        Thread::sleep(50);  // Let hardware switch to debug mode
+        
+        // Step 2: Set channel enable to all channels (0x0F)
+        // This enables all 4 channel groups for maximum channel count
+        if (!intanInterface->setChannelEnable(0x0F))
+        {
+            LOGE("Failed to set channel enable for debug mode");
+            CoreServices::sendStatusMessage("Intan: Failed to configure channels");
+            debugMode = false;
+            return;
+        }
+        
+        Thread::sleep(50);  // Let channel config take effect
+        
+        // Step 5: Update local configuration
+        channel_enable_mask = 0x0F;
+        num_channels = 140;  // 4 × 35 channels (will show as 128 in the UI)
+        
+        LOGC("Debug mode enabled successfully - hardware configured for synthetic data");
+        LOGC("Channel mask: 0x0F, Channels: ", num_channels);
+        
+        // Step 6: Update the chip display in the editor
+        if (sn->getEditor() != nullptr)
+        {
+            IntanSocketEditor* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
+            
+            // Create a fake detection result showing 2x RHD2164 chips (64 channels each)
+            IntanInterface::AutoDetectionResult debugResult;
+            debugResult.success = true;
+            debugResult.chipsDetected = true;
+            debugResult.cipo0Detected = true;
+            debugResult.cipo1Detected = true;
+            debugResult.cipo0ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.cipo1ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.cipo0HasDdr = false;
+            debugResult.cipo1HasDdr = false;
+            debugResult.optimalChannelMask = 0x0F;
+            debugResult.bestPhase0 = 0;
+            debugResult.bestPhase1 = 0;
+            
+            editor->updateChipDetection(debugResult);
+        }
+        
+        // Step 7: Update the signal chain to reflect new channel count
+        CoreServices::updateSignalChain(sn->getEditor());
+        CoreServices::sendStatusMessage("Intan: Debug mode enabled (128 channels)");
+    }
+    else
+    {
+        // ====================================================================
+        // DISABLE DEBUG MODE
+        // ====================================================================
+        
+        LOGC("Disabling debug mode");
+        
+        // Check if we have a connection to the hardware
+        if (!intanInterface || !intanInterface->isReady())
+        {
+            LOGD("Debug mode disabled (device not connected)");
+            debugMode = false;
+            return;
+        }
+        
+        // Step 1: Send hardware debug mode disable command (0x12 SET_DEBUG_MODE with param1=0)
+        if (!intanInterface->setDebugMode(false))
+        {
+            LOGE("Failed to send debug mode disable command to hardware");
+            // Continue anyway - we want to update the UI
+        }
+        
+        Thread::sleep(50);
+        
+        // Step 2: Reset to default channel configuration
+        // Note: You may want to restore the previous channel enable state
+        // For now, we'll set it to a reasonable default (all channels)
+        if (!intanInterface->setChannelEnable(0x0F))
+        {
+            LOGE("Failed to reset channel enable");
+        }
+        
+        Thread::sleep(50);
+        
+        // Step 4: Clear the chip displays
+        if (sn->getEditor() != nullptr)
+        {
+            IntanSocketEditor* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
+            
+            // Clear the chip displays - user should run RESCAN to detect real chips
+            IntanInterface::AutoDetectionResult clearResult;
+            clearResult.success = false;
+            clearResult.chipsDetected = false;
+            clearResult.cipo0Detected = false;
+            clearResult.cipo1Detected = false;
+            clearResult.cipo0ChipType = IntanInterface::ChipType::NONE;
+            clearResult.cipo1ChipType = IntanInterface::ChipType::NONE;
+            
+            editor->updateChipDetection(clearResult);
+        }
+        
+        LOGC("Debug mode disabled - use RESCAN to detect actual chips");
+        CoreServices::sendStatusMessage("Intan: Debug mode disabled - run RESCAN");
+    }
 }

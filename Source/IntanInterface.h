@@ -470,7 +470,7 @@ public:
      * @brief Get the expected packet size in words
      * 
      * Packet size depends on channel enable setting:
-     * - Header: 4 words (magic + timestamp)
+     * - Header: 10 words (magic + timestamp + digital + 2x analog)
      * - Data: variable based on enabled channels
      * 
      * @param channelMask Channel enable mask (0x0-0xF)

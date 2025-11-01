@@ -62,7 +62,7 @@ namespace {
     constexpr uint8_t ACK_ERROR = 0x15;
     
     // Packet header
-    constexpr size_t PACKET_HEADER_WORDS = 4;
+    constexpr size_t PACKET_HEADER_WORDS = 10;
     
     // Auto-detection constants
     constexpr uint16_t INTAN_PATTERN[] = {0x0049, 0x004E, 0x0054, 0x0041, 0x004E};  // 'I','N','T','A','N'
@@ -704,6 +704,15 @@ public:
     
     bool initializeForDetection(bool verbose) {
         // Disable debug mode to read real chip data
+        if (!sendCommand(CMD_STOP)) {
+            if (verbose) {
+                std::cout << "[Detection] ERROR: Failed to disable debug mode" << std::endl;
+            }
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+
         if (!sendCommand(CMD_SET_DEBUG_MODE, 0)) {
             if (verbose) {
                 std::cout << "[Detection] ERROR: Failed to disable debug mode" << std::endl;
@@ -836,8 +845,8 @@ public:
         double score = 0.0;
         ChipType chipType = ChipType::NONE;
         
-        // Extract data words (skip 4-word header)
-        std::vector<uint32_t> dataWords(packet.begin() + 4, packet.end());
+        // Extract data words (skip header)
+        std::vector<uint32_t> dataWords(packet.begin() + PACKET_HEADER_WORDS, packet.end());
         
         if (dataWords.size() < 35) {
             return {0.0, ChipType::NONE};
@@ -1133,7 +1142,7 @@ uint32_t IntanInterface::calculatePacketSize(uint8_t channelMask) {
     }
     
     if (numChannels == 0) {
-        return 74; // Default to maximum
+        return 80; // Default to maximum
     }
     
     uint32_t total16bitWords = 35 * numChannels;

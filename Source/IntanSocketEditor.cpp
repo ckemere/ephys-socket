@@ -202,6 +202,17 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     addAndMakeVisible(rescanButton.get());
     rescanButton->setVisible(false);
 
+    // Debug mode button
+    debugModeButton = std::make_unique<UtilityButton>("DEBUG MODE");
+    debugModeButton->setBounds(6, 117, 65, 18);
+    debugModeButton->addListener(this);
+    debugModeButton->setTooltip("Simulate 128 channels (2x64)");
+    addAndMakeVisible(debugModeButton.get());
+    debugModeButton->setVisible(false);
+
+    debugModeActive = false;
+
+
     // Sample rate interface
     sampleRateInterface = std::make_unique<SampleRateInterface>(node);
     sampleRateInterface->setBounds(80, 22, 80, 50);
@@ -247,6 +258,7 @@ void IntanSocketEditor::startAcquisition()
     rescanButton->setEnabledState(false);
     disconnectButton->setEnabled(false);
     disconnectButton->setAlpha(0.2f);
+    debugModeButton->setEnabledState(false);
 }
 
 void IntanSocketEditor::stopAcquisition()
@@ -259,6 +271,7 @@ void IntanSocketEditor::stopAcquisition()
     rescanButton->setEnabledState(true);
     disconnectButton->setEnabled(true);
     disconnectButton->setAlpha(1.0f);
+    debugModeButton->setEnabledState(true);
 }
 
 void IntanSocketEditor::buttonClicked(Button* button)
@@ -293,6 +306,29 @@ void IntanSocketEditor::buttonClicked(Button* button)
             }
         }
     }
+    else if (button == debugModeButton.get() && !acquisitionIsActive)
+    {
+        // Toggle the state
+        debugModeActive = !debugModeActive;
+
+        node->setDebugMode(debugModeActive);
+        
+        // Update button appearance based on state
+        if (debugModeActive)
+        {
+            debugModeButton->setLabel("DEBUG: ON");
+            debugModeButton->setColour(TextButton::buttonColourId, Colours::orange.darker(0.3f));
+            CoreServices::sendStatusMessage("Intan: Debug mode enabled (128 channels)");
+        }
+        else
+        {
+            debugModeButton->setLabel("DEBUG MODE");
+            debugModeButton->setColour(TextButton::buttonColourId, 
+                                    findColour(TextButton::buttonColourId));
+            CoreServices::sendStatusMessage("Intan: Debug mode disabled");
+        }
+    }
+
 }
 
 void IntanSocketEditor::comboBoxChanged(ComboBox* comboBox)
@@ -310,6 +346,7 @@ void IntanSocketEditor::connected()
     connectButton->setVisible(false);
     disconnectButton->setVisible(true);
     rescanButton->setVisible(true);
+    debugModeButton->setVisible(true);
 }
 
 void IntanSocketEditor::disconnected()
@@ -317,6 +354,7 @@ void IntanSocketEditor::disconnected()
     connectButton->setVisible(true);
     disconnectButton->setVisible(false);
     rescanButton->setVisible(false);
+    debugModeButton->setVisible(true);
     
     // Reset chip displays
     cipo0Interface->updateChipStatus(false, IntanInterface::ChipType::NONE);

@@ -78,6 +78,10 @@ public:
     /** Apply auto-detection configuration */
     bool applyDetectionConfig(const IntanInterface::AutoDetectionResult& result);
 
+    /** Debug mode is useful for testing. **/
+    void setDebugMode(bool enable);
+    bool isDebugMode() const { return debugMode; }
+
     
 private:
     const int bufferSizeInSeconds = 10;
@@ -122,6 +126,9 @@ private:
     
     /** Error tracking */
     std::atomic<bool> hasError;
+
+    /** Debug mode */
+    bool debugMode;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(IntanSocket);
 };
