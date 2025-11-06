@@ -18,6 +18,7 @@ public:
     const int DEFAULT_UDP_PORT = 5000;
     const float SAMPLE_RATE = 30000.0f; // Fixed for now
     const float DEFAULT_DATA_SCALE = 0.195f;    // Intan µV per bit
+    const float DEFAULT_AUX_DATA_SCALE = 0.0000374f;   // Intan AUX mV per bit
     
     /** Parameter limits */
     const int MIN_PORT = 1024;
@@ -30,9 +31,10 @@ public:
     int tcp_port;
     int udp_port;
     float data_scale;
+    float aux_data_scale;
 
-    int num_channels;
     uint8_t channel_enable_mask;
+    int num_channels;
 
     /** Constructor */
     IntanSocket(SourceNode* sn);
@@ -101,8 +103,13 @@ private:
     void processDataPacket(const uint32_t* data, size_t wordCount, uint64_t timestamp);
     
     /** Calculate number of channels from enable mask */
-    int calculateNumChannels(uint8_t mask);
-
+    int calculateNumChannels(uint8_t mask) {
+        return ( ((channel_enable_mask & 0b0001) != 0) + \
+                 ((channel_enable_mask & 0b0100) != 0) + \
+                 ((channel_enable_mask & 0b1000) != 0) + \
+                 ((channel_enable_mask & 0b0010) != 0) ) * 35;
+    };
+    
     /** Our IntanInterface library instance */
     std::unique_ptr<IntanInterface> intanInterface;
     
@@ -116,9 +123,6 @@ private:
     
     /** Buffers for conversion */
     std::vector<float> convbuf;
-    Array<int64> sampleNumbers;
-    Array<double> timestamps;
-    Array<uint64> ttlEventWords;
     
     /** Sample counter */
     int64 totalSamples;

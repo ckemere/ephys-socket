@@ -15,8 +15,8 @@ IntanSocket::IntanSocket(SourceNode* sn)
     tcp_port = DEFAULT_TCP_PORT;
     udp_port = DEFAULT_UDP_PORT;
     data_scale = DEFAULT_DATA_SCALE;
+    aux_data_scale = DEFAULT_AUX_DATA_SCALE;
     channel_enable_mask = 0x0F;  // All channels enabled by default
-    num_channels = 4;
     totalSamples = 0;
     eventState = 0;
     hasError = false;
@@ -74,6 +74,15 @@ void IntanSocket::registerParameters()
                      "Data scale (µV per bit)", 
                      "", 
                      DEFAULT_DATA_SCALE, 
+                     MIN_DATA_SCALE, 
+                     MAX_DATA_SCALE, 
+                     0.01f);
+    addFloatParameter(Parameter::PROCESSOR_SCOPE, 
+                     "aux_data_scale", 
+                     "Scale", 
+                     "Data scale (mV per bit)", 
+                     "", 
+                     DEFAULT_AUX_DATA_SCALE, 
                      MIN_DATA_SCALE, 
                      MAX_DATA_SCALE, 
                      0.01f);
@@ -159,7 +168,7 @@ bool IntanSocket::connectDevice(bool printOutput)
         if (intanInterface->getStatus(status))
         {
             channel_enable_mask = status.channelEnable;
-            num_channels = calculateNumChannels(channel_enable_mask);
+            int num_channels = calculateNumChannels(channel_enable_mask);
             
             if (printOutput)
             {
@@ -193,17 +202,6 @@ bool IntanSocket::errorFlag()
     return hasError.load();
 }
 
-int IntanSocket::calculateNumChannels(uint8_t mask)
-{
-    int count = 0;
-    for (int i = 0; i < 4; ++i)
-    {
-        if (mask & (1 << i))
-            count++;
-    }
-    return (count > 0) ? count : 1;  // At least 1
-}
-
 void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChannels,
                                  OwnedArray<EventChannel>* eventChannels,
                                  OwnedArray<SpikeChannel>* spikeChannels,
@@ -218,65 +216,93 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     configurationObjects->clear();
     sourceStreams->clear();
 
-    DataStream::Settings settings{
+    bool generatesTimestamps = true;
+
+    DataStream::Settings dataStreamSettings{
         "IntanStream",
         "Data from Intan neural interface",
         "intan.data",
-        SAMPLE_RATE
+        SAMPLE_RATE,
+        generatesTimestamps
     };
 
-    sourceStreams->add(new DataStream(settings));
+    DataStream* stream = new DataStream (dataStreamSettings);
+
+    sourceStreams->add(stream);
     
     // Calculate total channels based on channel_enable_mask
-    // Each bit enables 35 channels:
+    // Each bit enables 35 channels (32 + 3 aux):
     // Bit 0: channels 0-34
     // Bit 1: channels 35-69
     // Bit 2: channels 70-104
     // Bit 3: channels 105-140
     
-    num_channels = 0;
-    for (int i = 0; i < 4; ++i)
-    {
-        if (channel_enable_mask & (1 << i))
-            num_channels += 35;
-    }
+    // The 2164 DDR channel just resamples the aux input, so max is two
+    int n_aux_banks = ((channel_enable_mask & 0b0001) != 0) + ((channel_enable_mask & 0b0100) != 0); 
+    int n_data_banks = n_aux_banks + ((channel_enable_mask & 0b1000) != 0) + ((channel_enable_mask & 0b0010) != 0);
     
-    if (num_channels == 0)
+    int n_neural_channels = n_data_banks * 32;
+    if (n_neural_channels == 0)
     {
         LOGE("No channels enabled!");
-        num_channels = 35; // Fallback
+        n_neural_channels = 32; // Fallback
+        n_aux_banks = 3;
     }
     
     // Resize buffer
+    num_channels = n_data_banks * 35;
     sourceBuffers[0]->resize(num_channels, SAMPLE_RATE * bufferSizeInSeconds);
 
     // Create channels - simple sequential numbering
-    for (int ch = 0; ch < num_channels; ++ch)
+    for (int ch = 0; ch < n_neural_channels; ++ch)
     {
         ContinuousChannel::Settings chanSettings{
             ContinuousChannel::Type::ELECTRODE,
             "CH" + String(ch + 1),  // CH1, CH2, CH3, ... CH128
             "Intan neural data channel",
-            "intan.continuous",
+            "intan.continuous.ephys",
             data_scale,
-            sourceStreams->getFirst()
+            stream
         };
         
         continuousChannels->add(new ContinuousChannel(chanSettings));
+        continuousChannels->getLast()->setUnits ("uV");
+
     }
 
-    EventChannel::Settings eventSettings{
+    for (int a = 0; a < n_aux_banks; a++)
+    {
+        for (int ch = 0; ch < 3; ch++)
+        {
+            ContinuousChannel::Settings channelSettings {
+                ContinuousChannel::AUX,
+                "AUX" + String(a + 1) + "_CH" + String (ch + 1),
+                "Intan aux input channel",
+                "intan.continuous.aux",
+                data_scale,
+                stream
+            };
+
+            continuousChannels->add (new ContinuousChannel (channelSettings));
+            continuousChannels->getLast()->setUnits ("mV");
+        }
+    }    
+
+    // ============================================================
+    // TTL EVENT CHANNELS
+    // ============================================================
+    EventChannel::Settings settings {
         EventChannel::Type::TTL,
-        "Events",
-        "Events from Intan interface",
-        "intan.events",
-        sourceStreams->getFirst(),
-        1
+        "Acquisition Board TTL Input",
+        "Events on digital input lines of an Open Ephys Acquisition Board",
+        "acq-board.rhythm.events",
+        stream,
+        8
     };
 
-    eventChannels->add(new EventChannel(eventSettings));
-    
-    LOGC("Configured ", num_channels, " channels");
+    eventChannels->add (new EventChannel (settings));
+        
+    LOGC("Configured ", n_neural_channels, " channels");
 }
 
 bool IntanSocket::foundInputSource()
@@ -319,10 +345,6 @@ bool IntanSocket::startAcquisition()
     
     // Resize buffers - ONE time sample per packet across all channels
     convbuf.resize(num_channels);      // 140 channels × 1 sample
-    sampleNumbers.resize(1);           // 1 time sample
-    timestamps.clear();
-    timestamps.insertMultiple(0, 0.0, 1);  // 1 timestamp
-    ttlEventWords.resize(1);           // 1 TTL word
     
     totalSamples = 0;
     eventState = 0;
@@ -426,11 +448,12 @@ bool IntanSocket::updateBuffer()
         packet = dataQueue.front();
         dataQueue.pop();
     }
-    
+
+    int64 timestamp = (static_cast<uint64_t>(packet.data.data()[3]) << 32) | packet.data.data()[2];
+
     // Skip header (first 10 words: magic + timestamp)
     const uint32_t* dataWords = packet.data.data() + 10;
     size_t numDataWords = packet.data.size() - 10;
-
 
     // Periodic logging (every 30000 samples = once per second at 30kHz)
     static int64 logCounter = 0;
@@ -477,15 +500,16 @@ bool IntanSocket::updateBuffer()
         }
     }
     
-    // Add ONE sample (across all channels) to the buffer
-    sampleNumbers.set(0, totalSamples++);
-    ttlEventWords.set(0, eventState);
-    timestamps.set(0, 0.0);
+    uint64 ttlEventWord = (static_cast<uint64_t>(packet.data.data()[5]) << 32) | packet.data.data()[4];
+    ttlEventWord = ttlEventWord & 0x00000000000000FF; // digital input is least significant 8 bits
+
+
+    double ts;
     
     sourceBuffers[0]->addToBuffer(convbuf.data(),
-                                   sampleNumbers.getRawDataPointer(),
-                                   timestamps.getRawDataPointer(),
-                                   ttlEventWords.getRawDataPointer(),
+                                   &timestamp,
+                                   &ts,
+                                   &ttlEventWord,
                                    1);  // ONE time sample
     
     return true;
@@ -526,7 +550,7 @@ bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult
     
     // Update local channel enable state
     channel_enable_mask = result.optimalChannelMask;
-    num_channels = calculateNumChannels(channel_enable_mask);
+    int num_channels = calculateNumChannels(channel_enable_mask);
     
     LOGC("Applied detection config - ", num_channels, " channels enabled");
     
