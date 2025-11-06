@@ -21,7 +21,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 */
 
-#include "EphysSocket.h"
+#include "IntanSocket.h"
 #include <PluginInfo.h>
 #include <string>
 #ifdef _WIN32
@@ -37,7 +37,7 @@ using namespace Plugin;
 extern "C" EXPORT void getLibInfo (Plugin::LibraryInfo* info)
 {
     info->apiVersion = PLUGIN_API_VER;
-    info->name = "Ephys Socket";
+    info->name = "Intan UDP Interface";
     info->libVersion = "1.0.0";
     info->numPlugins = NUM_PLUGINS;
 }
@@ -48,8 +48,8 @@ extern "C" EXPORT int getPluginInfo (int index, Plugin::PluginInfo* info)
     {
         case 0:
             info->type = Plugin::Type::DATA_THREAD;
-            info->dataThread.name = "Ephys Socket";
-            info->dataThread.creator = &createDataThread<EphysSocketNode::EphysSocket>;
+            info->dataThread.name = "Intan UDP Interface Thread";
+            info->dataThread.creator = &createDataThread<IntanSocketNode::IntanSocket>;
             break;
         default:
             return -1;
