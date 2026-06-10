@@ -18,7 +18,7 @@ public:
     const int DEFAULT_UDP_PORT = 5000;
     const float SAMPLE_RATE = 30000.0f; // Fixed for now
     const float DEFAULT_DATA_SCALE = 0.195f;    // Intan µV per bit
-    const float DEFAULT_AUX_DATA_SCALE = 0.0000374f;   // Intan AUX mV per bit
+    const float DEFAULT_AUX_DATA_SCALE = 0.195f;   // µV per bit (display scale, matches amplifiers)
     
     /** Parameter limits */
     const int MIN_PORT = 1024;

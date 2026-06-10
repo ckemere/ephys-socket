@@ -78,9 +78,9 @@ void IntanSocket::registerParameters()
                      MAX_DATA_SCALE, 
                      0.01f);
     addFloatParameter(Parameter::PROCESSOR_SCOPE, 
-                     "aux_data_scale", 
-                     "Scale", 
-                     "Data scale (mV per bit)", 
+                     "aux_data_scale",
+                     "Scale",
+                     "Aux data scale (uV per bit)",
                      "", 
                      DEFAULT_AUX_DATA_SCALE, 
                      MIN_DATA_SCALE, 
@@ -301,7 +301,7 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
             };
 
             continuousChannels->add (new ContinuousChannel (channelSettings));
-            continuousChannels->getLast()->setUnits ("mV");
+            continuousChannels->getLast()->setUnits ("uV");
         }
     }
 
@@ -509,8 +509,9 @@ bool IntanSocket::updateBuffer()
     //      arrives in cycle (i+2) mod 35. The convert sequence issues
     //      amplifier ch 0..31 then 3 aux reads, so amplifier ch k lands in
     //      cycle (k+2), and aux 0/1/2 land in cycles 34/0/1.
-    // Amplifier output is offset binary (baseline 0x8000); non-amplifier (aux)
-    // channels are always UNSIGNED, so they get no offset.
+    // Amplifier output is offset binary (baseline 0x8000), converted to signed
+    // counts. Aux is physically unsigned but is centered the same way for
+    // display (see the aux loop below).
 
     convbuf.resize(num_channels);
 
@@ -547,8 +548,13 @@ bool IntanSocket::updateBuffer()
         }
     }
 
-    // Aux channels: only the regular streams (bit 0 / bit 2), cycles 34/0/1,
-    // unsigned (no offset).
+    // Aux channels: only the regular streams (bit 0 / bit 2), cycles 34/0/1.
+    // Aux (e.g. a headstage accelerometer on auxin1/2/3) is physically
+    // unsigned, but we subtract mid-scale and use the same uV scaling as the
+    // amplifiers purely so the trace is centered and visible in the viewer
+    // (an un-centered unsigned pedestal sits off-screen). This matches the
+    // prior, working display; absolute aux calibration (true LSB ~37.4 uV) is
+    // not applied.
     const int auxCycle[3] = {34, 0, 1};
     for (int s = 0; s < nStreams; ++s)
     {
@@ -558,7 +564,7 @@ bool IntanSocket::updateBuffer()
         for (int a = 0; a < 3; ++a)
         {
             int flat = auxCycle[a] * nStreams + s;
-            convbuf[outCh++] = (float)sampleAt(flat);
+            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
         }
     }
 
