@@ -102,12 +102,23 @@ private:
     /** Converts Intan data packet to Open Ephys format */
     void processDataPacket(const uint32_t* data, size_t wordCount, uint64_t timestamp);
     
-    /** Calculate number of channels from enable mask */
+    /** Number of enabled 16-bit data streams in the mask
+        (bit0=CIPO0 reg, bit1=CIPO0 DDR, bit2=CIPO1 reg, bit3=CIPO1 DDR) */
+    static int countStreams(uint8_t mask) {
+        return ((mask & 0b0001) != 0) + ((mask & 0b0010) != 0)
+             + ((mask & 0b0100) != 0) + ((mask & 0b1000) != 0);
+    }
+
+    /** Number of aux banks. Only the two "regular" streams (CIPO0_REG,
+        CIPO1_REG) carry aux inputs; the DDR streams just resample them. */
+    static int countAuxBanks(uint8_t mask) {
+        return ((mask & 0b0001) != 0) + ((mask & 0b0100) != 0);
+    }
+
+    /** Total Open Ephys channels for a mask: 32 amplifiers per stream
+        plus 3 aux inputs per aux bank. */
     int calculateNumChannels(uint8_t mask) {
-        return ( ((channel_enable_mask & 0b0001) != 0) + \
-                 ((channel_enable_mask & 0b0100) != 0) + \
-                 ((channel_enable_mask & 0b1000) != 0) + \
-                 ((channel_enable_mask & 0b0010) != 0) ) * 35;
+        return countStreams(mask) * 32 + countAuxBanks(mask) * 3;
     };
     
     /** Our IntanInterface library instance */
