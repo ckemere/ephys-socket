@@ -476,10 +476,11 @@ bool IntanSocket::updateBuffer()
     const uint32_t* dataWords = packet.data.data() + 10;
     size_t numDataWords = packet.data.size() - 10;
 
-    // Periodic logging (every 30000 samples = once per second at 30kHz)
-    static int64 logCounter = 0;
-    bool shouldLog = (totalSamples % 29000 == 0);
-    
+    // Periodic logging: once per second at 30 kHz (one time-sample per packet).
+    // NOTE: totalSamples is incremented at the end of this function; gating
+    // on it directly was firing every packet because it was never bumped.
+    bool shouldLog = (totalSamples % 30000 == 0);
+
     if (shouldLog) {
         LOGC("=== PACKET DEBUG (sample ", totalSamples, ") ===");
         LOGC("Total packet words: ", packet.data.size());
@@ -583,7 +584,9 @@ bool IntanSocket::updateBuffer()
                                    &ts,
                                    &ttlEventWord,
                                    1);  // ONE time sample
-    
+
+    totalSamples++;
+
     return true;
 }
 
