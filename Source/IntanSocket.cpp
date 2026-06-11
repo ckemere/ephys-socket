@@ -78,9 +78,9 @@ void IntanSocket::registerParameters()
                      MAX_DATA_SCALE, 
                      0.01f);
     addFloatParameter(Parameter::PROCESSOR_SCOPE, 
-                     "aux_data_scale", 
-                     "Scale", 
-                     "Data scale (mV per bit)", 
+                     "aux_data_scale",
+                     "Scale",
+                     "Aux data scale (uV per bit)",
                      "", 
                      DEFAULT_AUX_DATA_SCALE, 
                      MIN_DATA_SCALE, 
@@ -168,7 +168,7 @@ bool IntanSocket::connectDevice(bool printOutput)
         if (intanInterface->getStatus(status))
         {
             channel_enable_mask = status.channelEnable;
-            int num_channels = calculateNumChannels(channel_enable_mask);
+            num_channels = calculateNumChannels(channel_enable_mask);
             
             if (printOutput)
             {
@@ -230,63 +230,80 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
 
     sourceStreams->add(stream);
     
-    // Calculate total channels based on channel_enable_mask
-    // Each bit enables 35 channels (32 + 3 aux):
-    // Bit 0: channels 0-34
-    // Bit 1: channels 35-69
-    // Bit 2: channels 70-104
-    // Bit 3: channels 105-140
-    
-    // The 2164 DDR channel just resamples the aux input, so max is two
-    int n_aux_banks = ((channel_enable_mask & 0b0001) != 0) + ((channel_enable_mask & 0b0100) != 0); 
-    int n_data_banks = n_aux_banks + ((channel_enable_mask & 0b1000) != 0) + ((channel_enable_mask & 0b0010) != 0);
-    
-    int n_neural_channels = n_data_banks * 32;
-    if (n_neural_channels == 0)
-    {
+    // ------------------------------------------------------------------
+    // Build the channel layout from the active stream mask.
+    //
+    // The PL emits, per acquisition cycle, the enabled 16-bit segments in
+    // bit order: bit0=CIPO0 regular, bit1=CIPO0 DDR, bit2=CIPO1 regular,
+    // bit3=CIPO1 DDR. Each stream carries 32 amplifier channels; only the
+    // two "regular" streams additionally carry the 3 aux inputs (the DDR
+    // stream just resamples the same aux, so its aux samples are dropped).
+    //
+    // Channel order here MUST match the fill order in updateBuffer():
+    //   [stream0 CH1..32][stream1 CH1..32]...  then  [aux per regular stream]
+    // ------------------------------------------------------------------
+    int n_streams = countStreams(channel_enable_mask);
+    int n_aux_banks = countAuxBanks(channel_enable_mask);
+
+    if (n_streams == 0)
         LOGE("No channels enabled!");
-        n_neural_channels = 32; // Fallback
-        n_aux_banks = 3;
-    }
-    
-    // Resize buffer
-    num_channels = n_data_banks * 35;
-    sourceBuffers[0]->resize(num_channels, SAMPLE_RATE * bufferSizeInSeconds);
 
-    // Create channels - simple sequential numbering
-    for (int ch = 0; ch < n_neural_channels; ++ch)
+    int n_neural_channels = n_streams * 32;
+    num_channels = n_neural_channels + n_aux_banks * 3;
+
+    // Resize buffer to exactly the number of channels we publish
+    sourceBuffers[0]->resize(num_channels > 0 ? num_channels : 1,
+                             SAMPLE_RATE * bufferSizeInSeconds);
+
+    // Neural channels, grouped per stream (de-interleaved), sequential CH numbering
+    int neuralIdx = 0;
+    for (int b = 0; b < 4; ++b)
     {
-        ContinuousChannel::Settings chanSettings{
-            ContinuousChannel::Type::ELECTRODE,
-            "CH" + String(ch + 1),  // CH1, CH2, CH3, ... CH128
-            "Intan neural data channel",
-            "intan.continuous.ephys",
-            data_scale,
-            stream
-        };
-        
-        continuousChannels->add(new ContinuousChannel(chanSettings));
-        continuousChannels->getLast()->setUnits ("uV");
+        if ((channel_enable_mask & (1 << b)) == 0)
+            continue;
 
-    }
-
-    for (int a = 0; a < n_aux_banks; a++)
-    {
-        for (int ch = 0; ch < 3; ch++)
+        for (int k = 0; k < 32; ++k)
         {
-            ContinuousChannel::Settings channelSettings {
-                ContinuousChannel::AUX,
-                "AUX" + String(a + 1) + "_CH" + String (ch + 1),
-                "Intan aux input channel",
-                "intan.continuous.aux",
+            ContinuousChannel::Settings chanSettings{
+                ContinuousChannel::Type::ELECTRODE,
+                "CH" + String(neuralIdx + 1),  // CH1, CH2, ... CH128
+                "Intan neural data channel",
+                "intan.continuous.ephys",
                 data_scale,
                 stream
             };
 
-            continuousChannels->add (new ContinuousChannel (channelSettings));
-            continuousChannels->getLast()->setUnits ("mV");
+            continuousChannels->add(new ContinuousChannel(chanSettings));
+            continuousChannels->getLast()->setUnits("uV");
+            neuralIdx++;
         }
-    }    
+    }
+
+    // Aux channels, only for the regular streams (CIPO0 regular = bit0,
+    // CIPO1 regular = bit2), 3 per bank, clearly identified by CIPO line.
+    for (int b = 0; b < 4; ++b)
+    {
+        if ((channel_enable_mask & (1 << b)) == 0)
+            continue;
+        if (b != 0 && b != 2)
+            continue;  // only regular streams carry aux
+
+        int cipoNum = (b == 0) ? 0 : 1;
+        for (int a = 0; a < 3; ++a)
+        {
+            ContinuousChannel::Settings channelSettings {
+                ContinuousChannel::AUX,
+                "AUX" + String(cipoNum) + "_" + String(a + 1),  // AUX0_1..AUX1_3
+                "Intan aux input channel",
+                "intan.continuous.aux",
+                aux_data_scale,
+                stream
+            };
+
+            continuousChannels->add (new ContinuousChannel (channelSettings));
+            continuousChannels->getLast()->setUnits ("uV");
+        }
+    }
 
     // ============================================================
     // TTL EVENT CHANNELS
@@ -333,6 +350,10 @@ void IntanSocket::parameterValueChanged(Parameter* parameter)
     {
         data_scale = (float)parameter->getValue();
     }
+    else if (parameter->getName() == "aux_data_scale")
+    {
+        aux_data_scale = (float)parameter->getValue();
+    }
 }
 
 bool IntanSocket::startAcquisition()
@@ -344,7 +365,7 @@ bool IntanSocket::startAcquisition()
     }
     
     // Resize buffers - ONE time sample per packet across all channels
-    convbuf.resize(num_channels);      // 140 channels × 1 sample
+    convbuf.resize(num_channels);      // one time sample per channel
     
     totalSamples = 0;
     eventState = 0;
@@ -455,10 +476,11 @@ bool IntanSocket::updateBuffer()
     const uint32_t* dataWords = packet.data.data() + 10;
     size_t numDataWords = packet.data.size() - 10;
 
-    // Periodic logging (every 30000 samples = once per second at 30kHz)
-    static int64 logCounter = 0;
-    bool shouldLog = (totalSamples % 29000 == 0);
-    
+    // Periodic logging: once per second at 30 kHz (one time-sample per packet).
+    // NOTE: totalSamples is incremented at the end of this function; gating
+    // on it directly was firing every packet because it was never bumped.
+    bool shouldLog = (totalSamples % 30000 == 0);
+
     if (shouldLog) {
         LOGC("=== PACKET DEBUG (sample ", totalSamples, ") ===");
         LOGC("Total packet words: ", packet.data.size());
@@ -473,32 +495,83 @@ bool IntanSocket::updateBuffer()
         }
     }
 
-    // Each packet contains ONE time sample for each channel
-    // Data is packed as 16-bit signed integers in 32-bit words
-    
+    // Each packet contains ONE time sample for every channel.
+    //
+    // The data is a tight stream of 16-bit samples (two per 32-bit word, low
+    // half first). For each acquisition cycle c (0..34) the PL appends the
+    // enabled streams in bit order: bit0=CIPO0 reg, bit1=CIPO0 DDR,
+    // bit2=CIPO1 reg, bit3=CIPO1 DDR. So a stream's sample for cycle c sits at
+    // flat index  c * nStreams + slot,  where slot is its rank among the
+    // enabled streams (== its bit-order rank).
+    //
+    // Two corrections vs. a naive copy:
+    //   1. De-interleave: group each stream's 35 cycles back together.
+    //   2. Undo the 2-cycle SPI pipeline delay: the result of COPI command i
+    //      arrives in cycle (i+2) mod 35. The convert sequence issues
+    //      amplifier ch 0..31 then 3 aux reads, so amplifier ch k lands in
+    //      cycle (k+2), and aux 0/1/2 land in cycles 34/0/1.
+    // Amplifier output is offset binary (baseline 0x8000), converted to signed
+    // counts. Aux is physically unsigned but is centered the same way for
+    // display (see the aux loop below).
+
     convbuf.resize(num_channels);
-    
-    for (int ch = 0; ch < num_channels; ++ch)
+
+    int streamBits[4];
+    int nStreams = 0;
+    for (int b = 0; b < 4; ++b)
+        if (channel_enable_mask & (1 << b))
+            streamBits[nStreams++] = b;
+
+    const int nDataSamples = 35 * nStreams;
+
+    // Fetch one 16-bit sample by flat index into the de-interleaved data.
+    auto sampleAt = [&](int flatIdx) -> uint16_t {
+        if (flatIdx < 0 || flatIdx >= nDataSamples)
+            return 0x8000;  // midscale -> 0 after offset-binary conversion
+        int wordIdx = flatIdx / 2;
+        if ((size_t)wordIdx >= numDataWords)
+            return 0x8000;
+        if ((flatIdx & 1) == 0)
+            return (uint16_t)(dataWords[wordIdx] & 0xFFFF);       // low 16 bits
+        return (uint16_t)((dataWords[wordIdx] >> 16) & 0xFFFF);   // high 16 bits
+    };
+
+    int outCh = 0;
+
+    // Neural channels: de-interleaved, de-skewed, offset-binary -> signed.
+    for (int s = 0; s < nStreams; ++s)
     {
-        // Calculate which word and which half (low or high 16 bits)
-        int wordIdx = ch / 2;
-        int halfIdx = ch % 2;
-        
-        if (wordIdx < numDataWords)
+        for (int k = 0; k < 32; ++k)
         {
-            uint16_t sample;
-            if (halfIdx == 0)
-                sample = (uint16_t)(dataWords[wordIdx] & 0xFFFF);  // Low 16 bits
-            else
-                sample = (uint16_t)((dataWords[wordIdx] >> 16) & 0xFFFF);  // High 16 bits
-            
-            convbuf[ch] = (float)(sample - 32768);
-        }
-        else
-        {
-            convbuf[ch] = 0.0f;
+            int cycle = (k + 2) % 35;
+            int flat = cycle * nStreams + s;
+            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
         }
     }
+
+    // Aux channels: only the regular streams (bit 0 / bit 2), cycles 34/0/1.
+    // Aux (e.g. a headstage accelerometer on auxin1/2/3) is physically
+    // unsigned, but we subtract mid-scale and use the same uV scaling as the
+    // amplifiers purely so the trace is centered and visible in the viewer
+    // (an un-centered unsigned pedestal sits off-screen). This matches the
+    // prior, working display; absolute aux calibration (true LSB ~37.4 uV) is
+    // not applied.
+    const int auxCycle[3] = {34, 0, 1};
+    for (int s = 0; s < nStreams; ++s)
+    {
+        int b = streamBits[s];
+        if (b != 0 && b != 2)
+            continue;
+        for (int a = 0; a < 3; ++a)
+        {
+            int flat = auxCycle[a] * nStreams + s;
+            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
+        }
+    }
+
+    // Safety net: zero any channels we somehow didn't fill.
+    for (; outCh < num_channels; ++outCh)
+        convbuf[outCh] = 0.0f;
     
     uint64 ttlEventWord = (static_cast<uint64_t>(packet.data.data()[5]) << 32) | packet.data.data()[4];
     ttlEventWord = ttlEventWord & 0x00000000000000FF; // digital input is least significant 8 bits
@@ -511,7 +584,9 @@ bool IntanSocket::updateBuffer()
                                    &ts,
                                    &ttlEventWord,
                                    1);  // ONE time sample
-    
+
+    totalSamples++;
+
     return true;
 }
 
@@ -550,7 +625,7 @@ bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult
     
     // Update local channel enable state
     channel_enable_mask = result.optimalChannelMask;
-    int num_channels = calculateNumChannels(channel_enable_mask);
+    num_channels = calculateNumChannels(channel_enable_mask);
     
     LOGC("Applied detection config - ", num_channels, " channels enabled");
     
@@ -602,7 +677,7 @@ void IntanSocket::setDebugMode(bool enable)
         
         // Step 5: Update local configuration
         channel_enable_mask = 0x0F;
-        num_channels = 140;  // 4 × 35 channels (will show as 128 in the UI)
+        num_channels = calculateNumChannels(channel_enable_mask);  // 4×32 + 2×3 aux
         
         LOGC("Debug mode enabled successfully - hardware configured for synthetic data");
         LOGC("Channel mask: 0x0F, Channels: ", num_channels);
