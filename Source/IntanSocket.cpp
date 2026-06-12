@@ -898,10 +898,15 @@ void IntanSocket::setFastSettleTTLPin(int pin)
     fastSettleTTL = (pin >= 0 && pin <= 7) ? pin : -1;
     if (pushFastSettleConfig())
     {
+        // (LOGC expands to a statement with its own ';' -- keep braces)
         if (fastSettleTTL >= 0)
+        {
             LOGC("Fast settle following digital_in[", fastSettleTTL, "]");
+        }
         else
+        {
             LOGC("TTL fast settle disabled");
+        }
     }
 }
 
@@ -1000,10 +1005,14 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
 
     auxSeqMode = true;
     if (status.auxSeqEnabled)
+    {
         LOGC("Aux banks reloaded LIVE via standby-bank swap (slots now on banks ",
              target[0], "/", target[1], "/", target[2], ")");
+    }
     else
+    {
         LOGC("Aux sequencer enabled - accel de-interleave mode (10 kHz/axis)");
+    }
     CoreServices::sendStatusMessage("Intan: aux sequencer active");
     return true;
 }
