@@ -84,7 +84,31 @@ public:
     void setDebugMode(bool enable);
     bool isDebugMode() const { return debugMode; }
 
-    
+    // ------------------------------------------------------------------
+    // Aux command sequencer tooling (firmware aux-seq-v2)
+    // ------------------------------------------------------------------
+
+    /** Print the full device status (incl. aux sequencer state) to the
+        console. Safe to call during acquisition. */
+    void printDeviceStatus();
+
+    /** Software-triggered amplifier fast settle (RHD Reg-0 D5). Enables the
+        aux sequencer automatically if needed. Safe during acquisition. */
+    void setManualFastSettle(bool active);
+    bool isFastSettleOn() const { return fastSettleSw; }
+
+    /** Follow a digital_in pin for fast settle (-1 = off). Combined (OR)
+        with the software level in the PL. */
+    void setFastSettleTTLPin(int pin);
+
+    /** Switch the aux COPI slots to the banked sequencer programs
+        (accelerometer sweep on slot 1 -> one axis per packet, de-interleaved
+        here via the packet command echo). Toggling while acquiring uploads
+        the STANDBY banks and swaps them live -- this exercises the
+        double-buffer + atomic-swap path. */
+    bool setAuxSequencerMode(bool enable);
+    bool isAuxSequencerMode() const { return auxSeqMode; }
+
 private:
     const int bufferSizeInSeconds = 10;
     
@@ -144,6 +168,19 @@ private:
 
     /** Debug mode */
     bool debugMode;
+
+    /** Aux sequencer tooling state */
+    bool auxSeqMode = false;       // banked aux programs active
+    bool fastSettleSw = false;     // software fast-settle level
+    int fastSettleTTL = -1;        // digital_in pin for fast settle (-1 = off)
+
+    /** Push the combined fast-settle config to the device */
+    bool pushFastSettleConfig();
+
+    /** Sample-and-hold accelerometer state for sequencer-mode de-interleave:
+        [aux bank: 0=CIPO0, 1=CIPO1][axis 0..2], raw offset-binary samples */
+    uint16_t lastAccel[2][3] = {{0x8000, 0x8000, 0x8000},
+                                {0x8000, 0x8000, 0x8000}};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(IntanSocket);
 };
