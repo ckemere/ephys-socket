@@ -21,6 +21,8 @@ IntanSocket::IntanSocket(SourceNode* sn)
     eventState = 0;
     hasError = false;
     debugMode = false;
+    rawDataFile = nullptr;
+    rawDataPacketsWritten = 0;
 
     // Create IntanInterface (will throw if can't connect, so wrap in try)
     intanInterface = nullptr;
@@ -370,7 +372,23 @@ bool IntanSocket::startAcquisition()
     totalSamples = 0;
     eventState = 0;
     hasError = false;
-    
+    rawDataPacketsWritten = 0;
+
+    // Open raw-data capture file (first 500 packets, for offline analysis)
+    if (rawDataFile) { fclose(rawDataFile); rawDataFile = nullptr; }
+    rawDataFile = fopen("/tmp/intan_raw.bin", "wb");
+    if (rawDataFile)
+    {
+        // File header: magic, version, words-per-packet, channel-enable
+        uint32_t wordsPerPacket = (uint32_t)IntanInterface::calculatePacketSize(channel_enable_mask);
+        uint32_t fileHdr[4] = { 0x494E5441u, 1u, wordsPerPacket, channel_enable_mask };
+        fwrite(fileHdr, sizeof(uint32_t), 4, rawDataFile);
+        LOGC("Raw capture open: /tmp/intan_raw.bin  (", RAW_CAPTURE_PACKETS,
+             " packets, ", wordsPerPacket, " words each)");
+    }
+    else
+        LOGE("Could not open /tmp/intan_raw.bin for raw capture");
+
     // Clear any old data
     {
         std::lock_guard<std::mutex> lock(queueMutex);
@@ -434,7 +452,14 @@ bool IntanSocket::stopAcquisition()
     }
 
     sourceBuffers[0]->clear();
-    
+
+    if (rawDataFile)
+    {
+        fclose(rawDataFile);
+        rawDataFile = nullptr;
+        LOGC("Raw capture closed: /tmp/intan_raw.bin  (", rawDataPacketsWritten, " packets written)");
+    }
+
     LOGC("Intan acquisition stopped");
     return true;
 }
@@ -476,22 +501,16 @@ bool IntanSocket::updateBuffer()
     const uint32_t* dataWords = packet.data.data() + 10;
     size_t numDataWords = packet.data.size() - 10;
 
-    // Periodic logging: once per second at 30 kHz (one time-sample per packet).
-    // NOTE: totalSamples is incremented at the end of this function; gating
-    // on it directly was firing every packet because it was never bumped.
-    bool shouldLog = (totalSamples % 30000 == 0);
-
-    if (shouldLog) {
-        LOGC("=== PACKET DEBUG (sample ", totalSamples, ") ===");
-        LOGC("Total packet words: ", packet.data.size());
-        LOGC("Data words (after header): ", numDataWords);
-        LOGC("num_channels: ", num_channels);
-        LOGC("channel_enable_mask: 0x", String::toHexString(channel_enable_mask));
-        
-        // Show first few raw data words
-        LOGC("First 8 data words (hex):");
-        for (size_t i = 0; i < std::min(size_t(8), numDataWords); ++i) {
-            LOGC("  Word ", i, ": 0x", String::toHexString(dataWords[i]));
+    // Write raw packet to capture file for the first RAW_CAPTURE_PACKETS packets.
+    if (rawDataFile && rawDataPacketsWritten < RAW_CAPTURE_PACKETS)
+    {
+        fwrite(packet.data.data(), sizeof(uint32_t), packet.data.size(), rawDataFile);
+        ++rawDataPacketsWritten;
+        if (rawDataPacketsWritten == RAW_CAPTURE_PACKETS)
+        {
+            fclose(rawDataFile);
+            rawDataFile = nullptr;
+            LOGC("Raw capture complete: /tmp/intan_raw.bin  (", RAW_CAPTURE_PACKETS, " packets)");
         }
     }
 
@@ -545,7 +564,7 @@ bool IntanSocket::updateBuffer()
         {
             int cycle = (k + 2) % 35;
             int flat = cycle * nStreams + s;
-            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
+            convbuf[outCh++] = (float)((int)(sampleAt(flat) - 32768));
         }
     }
 

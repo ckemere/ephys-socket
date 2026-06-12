@@ -3,6 +3,7 @@
 
 #include <DataThreadHeaders.h>
 #include "IntanInterface.h"
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -144,6 +145,11 @@ private:
 
     /** Debug mode */
     bool debugMode;
+
+    /** Raw-data capture for offline analysis */
+    FILE* rawDataFile;
+    int   rawDataPacketsWritten;
+    static constexpr int RAW_CAPTURE_PACKETS = 500;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(IntanSocket);
 };
