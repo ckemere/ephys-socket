@@ -373,7 +373,7 @@ bool IntanSocket::startAcquisition()
     
     // Resize buffers - ONE time sample per packet across all channels
     convbuf.resize(num_channels);      // one time sample per channel
-    
+
     totalSamples = 0;
     eventState = 0;
     hasError = false;
@@ -483,24 +483,6 @@ bool IntanSocket::updateBuffer()
     const uint32_t* dataWords = packet.data.data() + 10;
     size_t numDataWords = packet.data.size() - 10;
 
-    // Periodic logging (every 30000 samples = once per second at 30kHz)
-    static int64 logCounter = 0;
-    bool shouldLog = (totalSamples % 29000 == 0);
-    
-    if (shouldLog) {
-        LOGC("=== PACKET DEBUG (sample ", totalSamples, ") ===");
-        LOGC("Total packet words: ", packet.data.size());
-        LOGC("Data words (after header): ", numDataWords);
-        LOGC("num_channels: ", num_channels);
-        LOGC("channel_enable_mask: 0x", String::toHexString(channel_enable_mask));
-        
-        // Show first few raw data words
-        LOGC("First 8 data words (hex):");
-        for (size_t i = 0; i < std::min(size_t(8), numDataWords); ++i) {
-            LOGC("  Word ", i, ": 0x", String::toHexString(dataWords[i]));
-        }
-    }
-
     // Each packet contains ONE time sample for every channel.
     //
     // The data is a tight stream of 16-bit samples (two per 32-bit word, low
@@ -555,11 +537,14 @@ bool IntanSocket::updateBuffer()
         }
     }
 
-    // Aux channels: only the regular streams (bit 0 / bit 2). Aux (e.g. a
-    // headstage accelerometer on auxin1/2/3) is physically unsigned, but we
-    // subtract mid-scale and use the same uV scaling as the amplifiers purely
-    // so the trace is centered and visible in the viewer. Absolute aux
-    // calibration (true LSB ~37.4 uV) is not applied.
+    // Aux channels: only the regular streams (bit 0 / bit 2). Aux samples are
+    // unsigned and are reported FAITHFULLY: raw counts scaled by the true
+    // Intan aux-ADC LSB (37.4 uV/bit, the Intan-software convention), no
+    // offset, no centering. An accelerometer axis therefore sits at its real
+    // operating point (~1.7e6 uV); the LFP viewer's AUX channel type has
+    // mV-denominated ranges (up to 2000 mV) plus "Auto" for exactly this.
+    // With bitVolts = 37.4 the record node's int16 quantization recovers the
+    // exact raw ADC counts on disk.
     //
     // TWO FORMATS, distinguished PER PACKET by the aux flags in header word 4
     // (the packet is self-describing, so this stays correct through live
@@ -594,7 +579,7 @@ bool IntanSocket::updateBuffer()
                 for (int a = 0; a < 3; ++a)
                 {
                     int flat = auxCycle[a] * nStreams + s;
-                    convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
+                    convbuf[outCh++] = (float)sampleAt(flat) * aux_data_scale;
                 }
             }
         }
@@ -615,7 +600,7 @@ bool IntanSocket::updateBuffer()
                     lastAccel[bank][convCh - 32] = sampleAt(0 * nStreams + s);
 
                 for (int a = 0; a < 3; ++a)
-                    convbuf[outCh++] = (float)((int)lastAccel[bank][a] - 32768);
+                    convbuf[outCh++] = (float)lastAccel[bank][a] * aux_data_scale;
             }
         }
     }

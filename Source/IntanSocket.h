@@ -18,7 +18,7 @@ public:
     const int DEFAULT_UDP_PORT = 5000;
     const float SAMPLE_RATE = 30000.0f; // Fixed for now
     const float DEFAULT_DATA_SCALE = 0.195f;    // Intan µV per bit
-    const float DEFAULT_AUX_DATA_SCALE = 0.195f;   // µV per bit (display scale, matches amplifiers)
+    const float DEFAULT_AUX_DATA_SCALE = 37.4f;   // µV per bit: true Intan aux-ADC LSB (datasheet/Intan-software convention)
     
     /** Parameter limits */
     const int MIN_PORT = 1024;
