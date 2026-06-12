@@ -216,6 +216,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     // Aux sequencer test tooling (firmware aux-seq-v2). These three work
     // DURING acquisition -- that is their purpose.
     // ------------------------------------------------------------------
+    // Always visible; greyed out until a device is connected.
     statusButton = std::make_unique<UtilityButton>("STATUS");
     statusButton->setFont(FontOptions("Small Text", 12, Font::bold));
     statusButton->setRadius(3.0f);
@@ -223,7 +224,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     statusButton->addListener(this);
     statusButton->setTooltip("Print full device status (incl. aux sequencer) to the console");
     addAndMakeVisible(statusButton.get());
-    statusButton->setVisible(false);
+    statusButton->setEnabledState(false);
 
     fastSettleButton = std::make_unique<UtilityButton>("SETTLE");
     fastSettleButton->setFont(FontOptions("Small Text", 12, Font::bold));
@@ -232,7 +233,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     fastSettleButton->addListener(this);
     fastSettleButton->setTooltip("Toggle amplifier fast settle (RHD Reg-0 D5) - hold for ~250 us per datasheet");
     addAndMakeVisible(fastSettleButton.get());
-    fastSettleButton->setVisible(false);
+    fastSettleButton->setEnabledState(false);
 
     auxModeButton = std::make_unique<UtilityButton>("AUX SEQ");
     auxModeButton->setFont(FontOptions("Small Text", 12, Font::bold));
@@ -242,7 +243,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     auxModeButton->setTooltip("Banked aux mode: accel sweep (1 axis/packet, echo de-interleave). "
                               "Toggling while acquiring exercises the live standby-bank swap");
     addAndMakeVisible(auxModeButton.get());
-    auxModeButton->setVisible(false);
+    auxModeButton->setEnabledState(false);
 
     fastSettleActive = false;
     auxModeActive = false;
@@ -437,9 +438,9 @@ void IntanSocketEditor::connected()
     disconnectButton->setVisible(true);
     rescanButton->setVisible(true);
     debugModeButton->setVisible(true);
-    statusButton->setVisible(true);
-    fastSettleButton->setVisible(true);
-    auxModeButton->setVisible(true);
+    statusButton->setEnabledState(true);
+    fastSettleButton->setEnabledState(true);
+    auxModeButton->setEnabledState(true);
     refreshAuxButtons();   // sync with device state (persists across reconnect)
 }
 
@@ -449,9 +450,9 @@ void IntanSocketEditor::disconnected()
     disconnectButton->setVisible(false);
     rescanButton->setVisible(false);
     debugModeButton->setVisible(true);
-    statusButton->setVisible(false);
-    fastSettleButton->setVisible(false);
-    auxModeButton->setVisible(false);
+    statusButton->setEnabledState(false);
+    fastSettleButton->setEnabledState(false);
+    auxModeButton->setEnabledState(false);
 
     // Reset chip displays
     cipo0Interface->updateChipStatus(false, IntanInterface::ChipType::NONE);
