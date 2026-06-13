@@ -73,6 +73,51 @@ The authoritative protocol documentation lives in the MicroZedIntanInterface
 repo: `docs/command-bank-design.md` (design), `docs/NIGHT_LOG-2026-06-11.md`
 (implementation + verification), and `firmware/include/main.h` (register map).
 
+## Channel scaling and data storage
+
+Scaling matches the OpenEphys **acquisition-board plugin** exactly. Every
+sample is published into the GUI data buffer as:
+
+```
+buffer_value = (raw_adc_count - 32768) * bitVolts
+```
+
+and the **same `bitVolts`** is declared on the channel:
+
+| Channel type | bitVolts | buffer units | units label |
+|---|---|---|---|
+| ELECTRODE (neural) | `0.195` | µV | `uV` |
+| AUX (auxin1/2/3, e.g. accelerometer) | `0.0000374` | — | `mV` |
+
+The `- 32768` decodes the chip's offset-binary samples to a signed value
+around zero; it is a constant, reversible representation choice (the same one
+the acquisition board makes), **not** a baseline subtraction or detrend — no
+acquired information is altered or lost.
+
+### What this means for recordings
+
+The Binary record engine converts each float back to `int16` as
+`int16 = buffer_value / bitVolts` (clamped to ±32767). Because the buffer value
+is `(raw - 32768) * bitVolts` and the channel's `bitVolts` is that same factor,
+the division cancels exactly:
+
+```
+int16_on_disk = (raw - 32768)
+```
+
+So the recording stores the **exact signed ADC count** (`raw - 32768`, range
+−32768…+32767 — precisely the int16 range, so it never clips), and the
+`bit_volts` field in `structure.oebin` lets any reader reconstruct the physical
+value as `int16 * bit_volts`. The stored data is a lossless representation of
+the raw acquired counts.
+
+> Note: this differs from earlier revisions of this plugin, which wrote raw
+> counts into the buffer while declaring a `bitVolts` ≠ 1. That displayed
+> amplitudes ~5× off and made `int16 = raw / bitVolts` overflow the int16
+> range, clipping large transients in the recording. The current scaling fixes
+> both, at the cost of changing the recorded values relative to those
+> revisions — re-derive any amplitude thresholds tuned against the old output.
+
 ## Building from source
 
 First, follow the instructions on [this page](https://open-ephys.github.io/gui-docs/Developer-Guide/Compiling-the-GUI.html)

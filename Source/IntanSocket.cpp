@@ -308,7 +308,10 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
             };
 
             continuousChannels->add (new ContinuousChannel (channelSettings));
-            continuousChannels->getLast()->setUnits ("uV");
+            // Match the acquisition-board plugin's AUX metadata so the LFP
+            // viewer ranges these the same way (mV-denominated AUX ranges).
+            continuousChannels->getLast()->setUnits ("mV");
+            continuousChannels->getLast()->inputRange = {-100.0f, 100.0f};
         }
     }
 
@@ -526,25 +529,30 @@ bool IntanSocket::updateBuffer()
 
     int outCh = 0;
 
-    // Neural channels: de-interleaved, de-skewed, offset-binary -> signed.
+    // Neural channels: de-interleaved, de-skewed, and converted exactly as the
+    // acquisition-board plugin does -- (raw_offset_binary - 32768) * 0.195 --
+    // so the buffer carries true microvolts. With bitVolts = data_scale = 0.195
+    // the record node stores (raw - 32768): the exact signed ADC count,
+    // full-range and lossless (see storage note in README.md).
     for (int s = 0; s < nStreams; ++s)
     {
         for (int k = 0; k < 32; ++k)
         {
             int cycle = (k + 2) % 35;
             int flat = cycle * nStreams + s;
-            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
+            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768) * data_scale;
         }
     }
 
-    // Aux channels: only the regular streams (bit 0 / bit 2). Aux samples are
-    // unsigned and are reported FAITHFULLY: raw counts scaled by the true
-    // Intan aux-ADC LSB (37.4 uV/bit, the Intan-software convention), no
-    // offset, no centering. An accelerometer axis therefore sits at its real
-    // operating point (~1.7e6 uV); the LFP viewer's AUX channel type has
-    // mV-denominated ranges (up to 2000 mV) plus "Auto" for exactly this.
-    // With bitVolts = 37.4 the record node's int16 quantization recovers the
-    // exact raw ADC counts on disk.
+    // Aux channels: only the regular streams (bit 0 / bit 2). Converted
+    // exactly as the acquisition-board plugin does -- (raw - 32768) * 0.0000374
+    // -- the same (raw - midscale) * bitVolts form as the neural channels, with
+    // bitVolts = aux_data_scale = 0.0000374. The record node therefore stores
+    // (raw - 32768): the exact signed ADC count, lossless. The midscale
+    // subtraction is a constant, reversible representation choice (matching the
+    // reference plugin), not a baseline/detrend -- no acquired information is
+    // lost. Headstage accelerometer on auxin1/2/3 lands at its real operating
+    // point; the LFP viewer's AUX channel type ranges accordingly.
     //
     // TWO FORMATS, distinguished PER PACKET by the aux flags in header word 4
     // (the packet is self-describing, so this stays correct through live
@@ -579,7 +587,7 @@ bool IntanSocket::updateBuffer()
                 for (int a = 0; a < 3; ++a)
                 {
                     int flat = auxCycle[a] * nStreams + s;
-                    convbuf[outCh++] = (float)sampleAt(flat) * aux_data_scale;
+                    convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768) * aux_data_scale;
                 }
             }
         }
@@ -600,7 +608,7 @@ bool IntanSocket::updateBuffer()
                     lastAccel[bank][convCh - 32] = sampleAt(0 * nStreams + s);
 
                 for (int a = 0; a < 3; ++a)
-                    convbuf[outCh++] = (float)lastAccel[bank][a] * aux_data_scale;
+                    convbuf[outCh++] = (float)((int)lastAccel[bank][a] - 32768) * aux_data_scale;
             }
         }
     }

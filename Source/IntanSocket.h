@@ -17,8 +17,13 @@ public:
     const int DEFAULT_TCP_PORT = 6000;
     const int DEFAULT_UDP_PORT = 5000;
     const float SAMPLE_RATE = 30000.0f; // Fixed for now
-    const float DEFAULT_DATA_SCALE = 0.195f;    // Intan µV per bit
-    const float DEFAULT_AUX_DATA_SCALE = 37.4f;   // µV per bit: true Intan aux-ADC LSB (datasheet/Intan-software convention)
+    // Scaling matches the OpenEphys acquisition-board plugin exactly
+    // (Source/devices/oni/AcqBoardONI.cpp getBitVolts + sample conversion):
+    // each sample is published as (raw_count - 32768) * bitVolts, and the
+    // SAME bitVolts is declared on the channel. See processDataPacket() and
+    // the storage note in README.md.
+    const float DEFAULT_DATA_SCALE = 0.195f;       // ELECTRODE bitVolts (Intan amplifier LSB, µV/bit)
+    const float DEFAULT_AUX_DATA_SCALE = 0.0000374f; // AUX bitVolts (Intan aux-ADC LSB)
     
     /** Parameter limits */
     const int MIN_PORT = 1024;
