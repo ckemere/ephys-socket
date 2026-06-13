@@ -14,6 +14,37 @@ generic matrix-over-TCP source with the MicroZed device protocol:
 - **UDP data** (port 5000): one packet per ~30 kHz sample; 10 header words +
   up to 70 data words depending on the channel-enable mask.
 
+The board firmware, the `remote/net.py` reference client, and this plugin are
+the **three consumers of the same register/packet contract** — see the
+MicroZed repo when changing the protocol.
+
+## Usage
+
+1. **Flash the board** with a current MicroZed image (`blobs/BOOT.bin` from the
+   MicroZedIntanInterface repo) and put it on the network. Default device IP is
+   `192.168.18.10`; put your host on the same subnet (port 6000 TCP control,
+   5000 UDP data).
+2. **Install the plugin** (see *Building from source* below) so OpenEphys finds
+   it in its `plugins` directory.
+3. In OpenEphys, open the **Processor List → Sources** and drag **Intan Socket**
+   in as the signal-chain source.
+4. In the editor, set **Device IP** (and TCP/UDP ports if non-default), then
+   click **CONNECT**. On success the chip indicators light and the STATUS /
+   SETTLE / AUX SEQ buttons enable.
+5. Click **RESCAN** to auto-detect the connected chip(s) and the optimal cable
+   phase; the channel count updates to match.
+6. Press **play** to stream. Neural channels appear as `CH1…`, aux inputs as
+   `AUX0_1…` (per CIPO line). Click **STATUS** at any time to dump full device
+   state to the console (View → **Console**, or Shift+C in a Release build).
+7. To exercise the run-time features: **SETTLE** toggles amplifier fast settle;
+   the **TTL Settle** dropdown makes fast settle follow a digital-input pin;
+   **AUX SEQ** switches the aux slots to the banked accelerometer/housekeeping
+   programs (and, toggled while streaming, performs a live bank swap).
+
+A connected **headstage accelerometer** (auxin1/2/3) shows up on the AUX
+channels — select the **AUX** channel type in the LFP viewer's range selector
+to see it at the right scale.
+
 ## Editor controls
 
 | Control | When | What |
@@ -154,6 +185,10 @@ was just created. Select the appropriate configuration (Debug/Release) and
 build the solution. Building the `INSTALL` project copies the `.dll` into the
 GUI's `plugins` directory.
 
+If your `plugin-GUI` is **not** one level up under an `OEPlugins/` sibling
+(e.g. it sits right next to this repo in a flat directory), pass its location
+explicitly to CMake with `-DGUI_BASE_DIR=/path/to/plugin-GUI`.
+
 ### Linux
 
 **Requirements:** [CMake](https://cmake.org/install/)
@@ -161,11 +196,15 @@ GUI's `plugins` directory.
 From the `Build` directory, enter:
 
 ```bash
-cmake -G "Unix Makefiles" ..
-cd Debug
+cmake -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release ..   # or Debug
 make -j
 make install
 ```
+
+`make install` copies `ephys-socket.so` into the GUI build's `plugins`
+directory for the matching build type — build the plugin with the **same**
+`CMAKE_BUILD_TYPE` as the GUI you launch (mixing Debug/Release can crash on
+load). Add `-DGUI_BASE_DIR=...` here too if the GUI isn't auto-found.
 
 ### macOS
 
