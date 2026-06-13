@@ -38,8 +38,9 @@ namespace {
     constexpr uint32_t PACKET_MAGIC_HIGH = 0xCAFEBABE;
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
-    constexpr size_t STATUS_RESPONSE_SIZE = 86;
-    
+    constexpr size_t STATUS_RESPONSE_SIZE = 98;        // aux-seq-v2 firmware
+    constexpr size_t STATUS_RESPONSE_SIZE_LEGACY = 86; // pre-aux firmware
+
     // Command IDs
     enum CommandId : uint32_t {
         CMD_START = 0x01,
@@ -54,7 +55,16 @@ namespace {
         CMD_LOAD_CABLE_TEST = 0x22,
         CMD_FULL_CABLE_TEST = 0x30,
         CMD_GET_STATUS = 0x40,
-        CMD_SET_UDP_DEST = 0x50
+        CMD_SET_UDP_DEST = 0x50,
+        // Aux command sequencer / override layer (firmware aux-seq-v2;
+        // mirrors firmware/src-core0/network.c + remote/net.py)
+        CMD_AUX_WRITE_WORD = 0x70,   // p1 = slot | bank<<8 | is_len<<16; p2 = addr<<16 | data
+        CMD_AUX_BANK_SELECT = 0x71,  // p1 = slot; p2 = bank (confirmed before ACK)
+        CMD_AUX_SEQ_EN = 0x72,       // p1 = 0/1
+        CMD_READ_REGISTER = 0x73,    // p1 = reg -> 4-byte {cipo1,cipo0} response
+        CMD_WRITE_REGISTER = 0x74,   // p1 = reg; p2 = value -> 4-byte echo response
+        CMD_SET_FAST_SETTLE = 0x75,  // p1 = amp: sw|gpio_en<<1|pin<<4; p2 = dsp: same layout
+        CMD_SET_DIGOUT = 0x76        // p1 = sw|gpio_en<<1|pin<<4; p2 = reg3_static byte
     };
     
     // ACK status codes
@@ -284,12 +294,13 @@ public:
         
         uint8_t data[STATUS_RESPONSE_SIZE];
         size_t dataLen = STATUS_RESPONSE_SIZE;
-        
+
         if (!self->sendCommand(CMD_GET_STATUS, 0, 0, data, &dataLen)) {
             return false;
         }
-        
-        if (dataLen != STATUS_RESPONSE_SIZE) {
+
+        // 98 bytes = aux-seq-v2 firmware; 86 = older firmware (no aux block)
+        if (dataLen != STATUS_RESPONSE_SIZE && dataLen != STATUS_RESPONSE_SIZE_LEGACY) {
             return false;
         }
         
@@ -335,8 +346,86 @@ public:
         status.udpDestIp = ipToString(udpDestIp);
         status.udpDestPort = unpackU32LE(p) & 0xFFFF; p += 2;
         p += 2; // format
-        status.udpBytesSent = unpackU32LE(p);
-        
+        status.udpBytesSent = unpackU32LE(p); p += 4;
+
+        // Aux sequencer status block (aux-seq-v2 firmware only)
+        status.hasAuxStatus = (dataLen >= STATUS_RESPONSE_SIZE);
+        status.auxSeqEnabled = false;
+        status.fastSettleActive = false;
+        status.digoutState = false;
+        status.dspResetActive = false;
+        status.auxBankActive = 0;
+        status.auxIndex[0] = status.auxIndex[1] = status.auxIndex[2] = 0;
+        status.auxReadResult = 0;
+        if (status.hasAuxStatus) {
+            status.auxReadResult = unpackU32LE(p); p += 4;
+            status.auxBankActive = *p++;
+            uint8_t auxFlags = *p++;
+            status.auxSeqEnabled    = (auxFlags & 0x01) != 0;
+            status.fastSettleActive = (auxFlags & 0x02) != 0;
+            status.digoutState      = (auxFlags & 0x04) != 0;
+            status.dspResetActive   = (auxFlags & 0x08) != 0;
+            status.auxIndex[0] = *p++;
+            status.auxIndex[1] = *p++;
+            status.auxIndex[2] = *p++;
+            // 3 reserved bytes follow
+        }
+
+        return true;
+    }
+
+    // ========================================================================
+    // AUX COMMAND SEQUENCER
+    // ========================================================================
+
+    bool auxUploadBank(int slot, int bank, const std::vector<uint16_t>& commands,
+                       int loopIndex) {
+        if (commands.empty() || commands.size() > 64 ||
+            loopIndex < 0 || loopIndex >= (int)commands.size()) {
+            reportError("auxUploadBank: bad program size/loop index");
+            return false;
+        }
+        uint32_t p1 = (slot & 3) | ((bank & 1) << 8);
+        for (size_t i = 0; i < commands.size(); ++i) {
+            uint32_t p2 = ((uint32_t)i << 16) | commands[i];
+            if (!sendCommand(CMD_AUX_WRITE_WORD, p1, p2)) {
+                reportError("auxUploadBank: word upload failed");
+                return false;
+            }
+        }
+        // Length record: loop index in [5:0], end index in [13:8]
+        uint32_t lengthData = (loopIndex & 0x3F) |
+                              (((uint32_t)(commands.size() - 1) & 0x3F) << 8);
+        return sendCommand(CMD_AUX_WRITE_WORD, p1 | (1u << 16), lengthData);
+    }
+
+    bool auxBankSelect(int slot, int bank) {
+        // Firmware polls bank_active (up to ~50 ms) before ACKing
+        return sendCommand(CMD_AUX_BANK_SELECT, slot & 3, bank & 1);
+    }
+
+    bool auxSeqEnable(bool enable) {
+        return sendCommand(CMD_AUX_SEQ_EN, enable ? 1 : 0);
+    }
+
+    bool setFastSettle(bool softwareLevel, bool gpioEnable, uint8_t gpioPin,
+                       bool dspReset) {
+        uint32_t p1 = (softwareLevel ? 1 : 0) | (gpioEnable ? 2 : 0)
+                    | ((uint32_t)(gpioPin & 7) << 4);
+        uint32_t p2 = (dspReset && softwareLevel) ? 1 : 0;  // DSP follows the SW level
+        return sendCommand(CMD_SET_FAST_SETTLE, p1, p2);
+    }
+
+    bool readRegister(uint8_t reg, uint16_t& cipo0Value, uint16_t& cipo1Value) {
+        uint8_t data[4];
+        size_t dataLen = sizeof(data);
+        if (!sendCommand(CMD_READ_REGISTER, reg & 0x3F, 0, data, &dataLen))
+            return false;
+        if (dataLen != 4)
+            return false;
+        uint32_t result = unpackU32LE(data);
+        cipo0Value = result & 0xFFFF;
+        cipo1Value = (result >> 16) & 0xFFFF;
         return true;
     }
     
@@ -1098,6 +1187,30 @@ bool IntanInterface::runFullCableTest() {
     return pImpl_->sendCommand(CMD_FULL_CABLE_TEST);
 }
 
+bool IntanInterface::auxUploadBank(int slot, int bank,
+                                   const std::vector<uint16_t>& commands,
+                                   int loopIndex) {
+    return pImpl_->auxUploadBank(slot, bank, commands, loopIndex);
+}
+
+bool IntanInterface::auxBankSelect(int slot, int bank) {
+    return pImpl_->auxBankSelect(slot, bank);
+}
+
+bool IntanInterface::auxSeqEnable(bool enable) {
+    return pImpl_->auxSeqEnable(enable);
+}
+
+bool IntanInterface::setFastSettle(bool softwareLevel, bool gpioEnable,
+                                   uint8_t gpioPin, bool dspReset) {
+    return pImpl_->setFastSettle(softwareLevel, gpioEnable, gpioPin, dspReset);
+}
+
+bool IntanInterface::readRegister(uint8_t reg, uint16_t& cipo0Value,
+                                  uint16_t& cipo1Value) {
+    return pImpl_->readRegister(reg, cipo0Value, cipo1Value);
+}
+
 void IntanInterface::setDataCallback(DataCallback callback) {
     pImpl_->setDataCallback(callback);
 }
@@ -1202,6 +1315,52 @@ std::string IntanInterface::DeviceStatus::getChannelEnableString() const {
     }
     
     return first ? "NONE" : oss.str();
+}
+
+std::string IntanInterface::DeviceStatus::getSummary() const {
+    std::ostringstream oss;
+    oss << "=== INTAN DEVICE STATUS ===\n";
+    oss << "Firmware: v" << getFirmwareVersionString()
+        << "  (protocol " << protocolVersion << ", device 0x"
+        << std::hex << deviceType << std::dec << ")\n";
+    oss << "--- PL Hardware ---\n";
+    oss << "Timestamp: " << timestamp
+        << "  Packets sent: " << packetsSent << "\n";
+    oss << "Transmission: " << (transmissionActive ? "ACTIVE" : "stopped")
+        << "  Loop limit: " << (loopLimitReached ? "reached" : "no")
+        << "  State/Cycle: " << (int)stateCounter << "/" << (int)cycleCounter << "\n";
+    oss << "BRAM write addr: " << bramWriteAddr
+        << "  FIFO count: " << fifoCount << "\n";
+    oss << "--- PS Software ---\n";
+    oss << "Packets received: " << packetsReceived
+        << "  Errors: " << errorCount << "\n";
+    oss << "UDP sent: " << udpPacketsSent
+        << "  UDP errors: " << udpSendErrors
+        << "  Packet size: " << packetSizeWords << " words\n";
+    oss << "--- Configuration ---\n";
+    oss << "Channels: 0x" << std::hex << (int)channelEnable << std::dec
+        << " (" << getChannelEnableString() << ")"
+        << "  Phase: " << (int)phase0 << "/" << (int)phase1
+        << "  Debug: " << (debugMode ? "ON" : "off") << "\n";
+    oss << "UDP dest: " << udpDestIp << ":" << udpDestPort << "\n";
+    oss << "--- Aux Sequencer ---\n";
+    if (!hasAuxStatus) {
+        oss << "(not supported by this firmware -- 86-byte status)\n";
+    } else {
+        oss << "Enabled: " << (auxSeqEnabled ? "YES" : "no")
+            << "  Fast settle: " << (fastSettleActive ? "ACTIVE" : "off")
+            << "  Digout: " << (digoutState ? "1" : "0")
+            << "  DSP reset: " << (dspResetActive ? "ACTIVE" : "off") << "\n";
+        oss << "Active banks: slot0=" << ((auxBankActive >> 0) & 1)
+            << " slot1=" << ((auxBankActive >> 1) & 1)
+            << " slot2=" << ((auxBankActive >> 2) & 1)
+            << "  Indices: " << (int)auxIndex[0] << "/"
+            << (int)auxIndex[1] << "/" << (int)auxIndex[2] << "\n";
+        oss << "Last inject result: 0x" << std::hex << std::setw(8)
+            << std::setfill('0') << auxReadResult << std::dec << "\n";
+    }
+    oss << "===========================";
+    return oss.str();
 }
 
 // ============================================================================

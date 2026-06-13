@@ -166,7 +166,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     : GenericEditor(parentNode)
 {
     node = socket;
-    desiredWidth = 340;
+    desiredWidth = 425;
 
     // Chip detection interfaces (CIPO0 and CIPO1)
     cipo0Interface = std::make_unique<ChipInterface>(node, 0);
@@ -212,6 +212,41 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
 
     debugModeActive = false;
 
+    // ------------------------------------------------------------------
+    // Aux sequencer test tooling (firmware aux-seq-v2). These three work
+    // DURING acquisition -- that is their purpose.
+    // ------------------------------------------------------------------
+    // Always visible; greyed out until a device is connected.
+    statusButton = std::make_unique<UtilityButton>("STATUS");
+    statusButton->setFont(FontOptions("Small Text", 12, Font::bold));
+    statusButton->setRadius(3.0f);
+    statusButton->setBounds(345, 28, 72, 18);
+    statusButton->addListener(this);
+    statusButton->setTooltip("Print full device status (incl. aux sequencer) to the console");
+    addAndMakeVisible(statusButton.get());
+    statusButton->setEnabledState(false);
+
+    fastSettleButton = std::make_unique<UtilityButton>("SETTLE");
+    fastSettleButton->setFont(FontOptions("Small Text", 12, Font::bold));
+    fastSettleButton->setRadius(3.0f);
+    fastSettleButton->setBounds(345, 53, 72, 18);
+    fastSettleButton->addListener(this);
+    fastSettleButton->setTooltip("Toggle amplifier fast settle (RHD Reg-0 D5) - hold for ~250 us per datasheet");
+    addAndMakeVisible(fastSettleButton.get());
+    fastSettleButton->setEnabledState(false);
+
+    auxModeButton = std::make_unique<UtilityButton>("AUX SEQ");
+    auxModeButton->setFont(FontOptions("Small Text", 12, Font::bold));
+    auxModeButton->setRadius(3.0f);
+    auxModeButton->setBounds(345, 78, 72, 18);
+    auxModeButton->addListener(this);
+    auxModeButton->setTooltip("Banked aux mode: accel sweep (1 axis/packet, echo de-interleave). "
+                              "Toggling while acquiring exercises the live standby-bank swap");
+    addAndMakeVisible(auxModeButton.get());
+    auxModeButton->setEnabledState(false);
+
+    fastSettleActive = false;
+    auxModeActive = false;
 
     // Sample rate interface
     sampleRateInterface = std::make_unique<SampleRateInterface>(node);
@@ -306,6 +341,27 @@ void IntanSocketEditor::buttonClicked(Button* button)
             }
         }
     }
+    else if (button == statusButton.get())
+    {
+        // Works during acquisition by design
+        node->printDeviceStatus();
+    }
+    else if (button == fastSettleButton.get())
+    {
+        // Works during acquisition by design (that is the point of settle)
+        fastSettleActive = !fastSettleActive;
+        node->setManualFastSettle(fastSettleActive);
+        refreshAuxButtons();
+    }
+    else if (button == auxModeButton.get())
+    {
+        // Works during acquisition by design: toggling while streaming
+        // uploads the STANDBY banks and swaps them live.
+        bool target = !auxModeActive;
+        if (node->setAuxSequencerMode(target))
+            auxModeActive = target;
+        refreshAuxButtons();
+    }
     else if (button == debugModeButton.get() && !acquisitionIsActive)
     {
         // Toggle the state
@@ -335,9 +391,44 @@ void IntanSocketEditor::comboBoxChanged(ComboBox* comboBox)
 {
     if (comboBox == ttlSettleCombo.get())
     {
-        int selectedChannel = ttlSettleCombo->getSelectedId();
-        // Placeholder - will implement TTL settle functionality
-        LOGD("TTL Settle changed to: ", selectedChannel);
+        // Id 1 = "-" (off); ids 2..9 = TTL1..TTL8 -> digital_in pins 0..7.
+        // Fast settle then follows the selected pin level (sampled once per
+        // packet in the PL; edge -> one injection packet each way).
+        int selectedId = ttlSettleCombo->getSelectedId();
+        node->setFastSettleTTLPin(selectedId >= 2 ? (selectedId - 2) : -1);
+        refreshAuxButtons();
+    }
+}
+
+void IntanSocketEditor::refreshAuxButtons()
+{
+    // Pull authoritative state from the node (it may have auto-enabled the
+    // sequencer for fast settle, or synced state on reconnect)
+    fastSettleActive = node->isFastSettleOn();
+    auxModeActive = node->isAuxSequencerMode();
+
+    if (fastSettleActive)
+    {
+        fastSettleButton->setLabel("SETTLE: ON");
+        fastSettleButton->setColour(TextButton::buttonColourId, Colours::red.darker(0.2f));
+    }
+    else
+    {
+        fastSettleButton->setLabel("SETTLE");
+        fastSettleButton->setColour(TextButton::buttonColourId,
+                                    findColour(TextButton::buttonColourId));
+    }
+
+    if (auxModeActive)
+    {
+        auxModeButton->setLabel("AUX: ON");
+        auxModeButton->setColour(TextButton::buttonColourId, Colours::orange.darker(0.3f));
+    }
+    else
+    {
+        auxModeButton->setLabel("AUX SEQ");
+        auxModeButton->setColour(TextButton::buttonColourId,
+                                 findColour(TextButton::buttonColourId));
     }
 }
 
@@ -347,6 +438,10 @@ void IntanSocketEditor::connected()
     disconnectButton->setVisible(true);
     rescanButton->setVisible(true);
     debugModeButton->setVisible(true);
+    statusButton->setEnabledState(true);
+    fastSettleButton->setEnabledState(true);
+    auxModeButton->setEnabledState(true);
+    refreshAuxButtons();   // sync with device state (persists across reconnect)
 }
 
 void IntanSocketEditor::disconnected()
@@ -355,7 +450,10 @@ void IntanSocketEditor::disconnected()
     disconnectButton->setVisible(false);
     rescanButton->setVisible(false);
     debugModeButton->setVisible(true);
-    
+    statusButton->setEnabledState(false);
+    fastSettleButton->setEnabledState(false);
+    auxModeButton->setEnabledState(false);
+
     // Reset chip displays
     cipo0Interface->updateChipStatus(false, IntanInterface::ChipType::NONE);
     cipo1Interface->updateChipStatus(false, IntanInterface::ChipType::NONE);

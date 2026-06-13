@@ -1,6 +1,8 @@
 #include "IntanSocket.h"
 #include "IntanSocketEditor.h"
 
+#include <sstream>
+
 using namespace IntanSocketNode;
 
 DataThread* IntanSocket::createDataThread(SourceNode* sn)
@@ -169,7 +171,12 @@ bool IntanSocket::connectDevice(bool printOutput)
         {
             channel_enable_mask = status.channelEnable;
             num_channels = calculateNumChannels(channel_enable_mask);
-            
+
+            // Sync local aux-sequencer state with the device (it persists
+            // across plugin reconnects)
+            auxSeqMode = status.hasAuxStatus && status.auxSeqEnabled;
+            fastSettleSw = status.hasAuxStatus && status.fastSettleActive;
+
             if (printOutput)
             {
                 LOGC("Connected to Intan device - ", num_channels, " channels active");
@@ -301,7 +308,10 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
             };
 
             continuousChannels->add (new ContinuousChannel (channelSettings));
-            continuousChannels->getLast()->setUnits ("uV");
+            // Match the acquisition-board plugin's AUX metadata so the LFP
+            // viewer ranges these the same way (mV-denominated AUX ranges).
+            continuousChannels->getLast()->setUnits ("mV");
+            continuousChannels->getLast()->inputRange = {-100.0f, 100.0f};
         }
     }
 
@@ -366,7 +376,7 @@ bool IntanSocket::startAcquisition()
     
     // Resize buffers - ONE time sample per packet across all channels
     convbuf.resize(num_channels);      // one time sample per channel
-    
+
     totalSamples = 0;
     eventState = 0;
     hasError = false;
@@ -476,24 +486,9 @@ bool IntanSocket::updateBuffer()
     const uint32_t* dataWords = packet.data.data() + 10;
     size_t numDataWords = packet.data.size() - 10;
 
-    // Periodic logging: once per second at 30 kHz (one time-sample per packet).
-    // NOTE: totalSamples is incremented at the end of this function; gating
-    // on it directly was firing every packet because it was never bumped.
-    bool shouldLog = (totalSamples % 30000 == 0);
-
-    if (shouldLog) {
-        LOGC("=== PACKET DEBUG (sample ", totalSamples, ") ===");
-        LOGC("Total packet words: ", packet.data.size());
-        LOGC("Data words (after header): ", numDataWords);
-        LOGC("num_channels: ", num_channels);
-        LOGC("channel_enable_mask: 0x", String::toHexString(channel_enable_mask));
-        
-        // Show first few raw data words
-        LOGC("First 8 data words (hex):");
-        for (size_t i = 0; i < std::min(size_t(8), numDataWords); ++i) {
-            LOGC("  Word ", i, ": 0x", String::toHexString(dataWords[i]));
-        }
-    }
+    // (Per-second PACKET DEBUG dump removed -- it was log spam; totalSamples
+    // is still incremented at the end of this function as a sample counter,
+    // preserving the upstream fix that made it actually count.)
 
     // Each packet contains ONE time sample for every channel.
     //
@@ -538,34 +533,87 @@ bool IntanSocket::updateBuffer()
 
     int outCh = 0;
 
-    // Neural channels: de-interleaved, de-skewed, offset-binary -> signed.
+    // Neural channels: de-interleaved, de-skewed, and converted exactly as the
+    // acquisition-board plugin does -- (raw_offset_binary - 32768) * 0.195 --
+    // so the buffer carries true microvolts. With bitVolts = data_scale = 0.195
+    // the record node stores (raw - 32768): the exact signed ADC count,
+    // full-range and lossless (see storage note in README.md).
     for (int s = 0; s < nStreams; ++s)
     {
         for (int k = 0; k < 32; ++k)
         {
             int cycle = (k + 2) % 35;
             int flat = cycle * nStreams + s;
-            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
+            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768) * data_scale;
         }
     }
 
-    // Aux channels: only the regular streams (bit 0 / bit 2), cycles 34/0/1.
-    // Aux (e.g. a headstage accelerometer on auxin1/2/3) is physically
-    // unsigned, but we subtract mid-scale and use the same uV scaling as the
-    // amplifiers purely so the trace is centered and visible in the viewer
-    // (an un-centered unsigned pedestal sits off-screen). This matches the
-    // prior, working display; absolute aux calibration (true LSB ~37.4 uV) is
-    // not applied.
-    const int auxCycle[3] = {34, 0, 1};
-    for (int s = 0; s < nStreams; ++s)
+    // Aux channels: only the regular streams (bit 0 / bit 2). Converted
+    // exactly as the acquisition-board plugin does -- (raw - 32768) * 0.0000374
+    // -- the same (raw - midscale) * bitVolts form as the neural channels, with
+    // bitVolts = aux_data_scale = 0.0000374. The record node therefore stores
+    // (raw - 32768): the exact signed ADC count, lossless. The midscale
+    // subtraction is a constant, reversible representation choice (matching the
+    // reference plugin), not a baseline/detrend -- no acquired information is
+    // lost. Headstage accelerometer on auxin1/2/3 lands at its real operating
+    // point; the LFP viewer's AUX channel type ranges accordingly.
+    //
+    // TWO FORMATS, distinguished PER PACKET by the aux flags in header word 4
+    // (the packet is self-describing, so this stays correct through live
+    // bank swaps and sequencer enable/disable -- firmware aux-seq-v2):
+    //
+    //  * Legacy (sequencer off, flags==0): the static table converts all
+    //    three aux inputs every packet; results sit at cycles 34/0/1.
+    //
+    //  * Aux-sequencer mode (flags bit0 set): slot 1 sweeps ONE accelerometer
+    //    axis per packet (CONVERT 32 -> 33 -> 34 looping, 10 kHz per axis).
+    //    Its result arrives at cycle 0 of the FOLLOWING packet, and that
+    //    packet's header word 5 [15:0] echoes the originating command, which
+    //    identifies the axis. De-interleave by echo with sample-and-hold so
+    //    the 3 output channels stay at the full 30 kHz buffer rate.
+    //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's
+    //    housekeeping result -- neither is accelerometer data in this mode.)
     {
-        int b = streamBits[s];
-        if (b != 0 && b != 2)
-            continue;
-        for (int a = 0; a < 3; ++a)
+        uint32_t hdr4 = packet.data.data()[4];
+        uint32_t hdr5 = packet.data.data()[5];
+        uint8_t auxFlags = (hdr4 >> 8) & 0xFF;
+        bool seqActive = (auxFlags & 0x01) != 0;
+        bool echoValid = (auxFlags & 0x10) != 0;
+
+        if (!seqActive)
         {
-            int flat = auxCycle[a] * nStreams + s;
-            convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768);
+            const int auxCycle[3] = {34, 0, 1};
+            for (int s = 0; s < nStreams; ++s)
+            {
+                int b = streamBits[s];
+                if (b != 0 && b != 2)
+                    continue;
+                for (int a = 0; a < 3; ++a)
+                {
+                    int flat = auxCycle[a] * nStreams + s;
+                    convbuf[outCh++] = (float)((int)sampleAt(flat) - 32768) * aux_data_scale;
+                }
+            }
+        }
+        else
+        {
+            uint16_t echo1 = hdr5 & 0xFFFF;          // slot-1 cmd answered @ cycle 0
+            bool isConvert = (echo1 & 0xC000) == 0;
+            int convCh = (echo1 >> 8) & 0x3F;
+
+            for (int s = 0; s < nStreams; ++s)
+            {
+                int b = streamBits[s];
+                if (b != 0 && b != 2)
+                    continue;
+                int bank = (b == 0) ? 0 : 1;
+
+                if (echoValid && isConvert && convCh >= 32 && convCh <= 34)
+                    lastAccel[bank][convCh - 32] = sampleAt(0 * nStreams + s);
+
+                for (int a = 0; a < 3; ++a)
+                    convbuf[outCh++] = (float)((int)lastAccel[bank][a] - 32768) * aux_data_scale;
+            }
         }
     }
 
@@ -763,4 +811,207 @@ void IntanSocket::setDebugMode(bool enable)
         LOGC("Debug mode disabled - use RESCAN to detect actual chips");
         CoreServices::sendStatusMessage("Intan: Debug mode disabled - run RESCAN");
     }
+}
+// ============================================================================
+// AUX COMMAND SEQUENCER TOOLING (firmware aux-seq-v2)
+// ============================================================================
+
+void IntanSocket::printDeviceStatus()
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("Cannot print status - device not connected");
+        CoreServices::sendStatusMessage("Intan: not connected");
+        return;
+    }
+
+    IntanInterface::DeviceStatus status;
+    if (!intanInterface->getStatus(status))
+    {
+        LOGE("Failed to read device status");
+        CoreServices::sendStatusMessage("Intan: status read failed");
+        return;
+    }
+
+    // Emit line-by-line so each line gets the console prefix
+    std::istringstream iss(status.getSummary());
+    std::string line;
+    while (std::getline(iss, line))
+        LOGC(line);
+
+    CoreServices::sendStatusMessage("Intan: status printed to console");
+}
+
+bool IntanSocket::pushFastSettleConfig()
+{
+    if (!intanInterface)
+        return false;
+    bool gpioEn = fastSettleTTL >= 0;
+    return intanInterface->setFastSettle(fastSettleSw, gpioEn,
+                                         gpioEn ? (uint8_t)fastSettleTTL : 0,
+                                         false /* no DSP reset by default */);
+}
+
+void IntanSocket::setManualFastSettle(bool active)
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("Fast settle: device not connected");
+        return;
+    }
+
+    // The override layer only reaches the chip while the sequencer is on
+    if (active && !auxSeqMode)
+    {
+        LOGC("Fast settle requires the aux sequencer - enabling aux mode first");
+        if (!setAuxSequencerMode(true))
+            return;
+    }
+
+    fastSettleSw = active;
+    if (pushFastSettleConfig())
+    {
+        LOGC("Fast settle ", active ? "ON" : "OFF",
+             " (RHD Reg-0 D5 via slot-0 injection)");
+        CoreServices::sendStatusMessage(active ? "Intan: FAST SETTLE ON"
+                                               : "Intan: fast settle off");
+    }
+    else
+    {
+        LOGE("Fast settle command failed");
+    }
+}
+
+void IntanSocket::setFastSettleTTLPin(int pin)
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+        return;
+
+    if (pin >= 0 && !auxSeqMode)
+    {
+        LOGC("TTL fast settle requires the aux sequencer - enabling aux mode first");
+        if (!setAuxSequencerMode(true))
+            return;
+    }
+
+    fastSettleTTL = (pin >= 0 && pin <= 7) ? pin : -1;
+    if (pushFastSettleConfig())
+    {
+        // (LOGC expands to a statement with its own ';' -- keep braces)
+        if (fastSettleTTL >= 0)
+        {
+            LOGC("Fast settle following digital_in[", fastSettleTTL, "]");
+        }
+        else
+        {
+            LOGC("TTL fast settle disabled");
+        }
+    }
+}
+
+bool IntanSocket::setAuxSequencerMode(bool enable)
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("Aux sequencer: device not connected");
+        return false;
+    }
+
+    if (!enable)
+    {
+        // Firmware clears the live fast-settle/digout sources and waits one
+        // packet before dropping the enable (so the chip is never left
+        // clamped); mirror the local state.
+        fastSettleSw = false;
+        if (!intanInterface->auxSeqEnable(false))
+        {
+            LOGE("Failed to disable aux sequencer");
+            return false;
+        }
+        auxSeqMode = false;
+        LOGC("Aux sequencer disabled - legacy aux format (all 3 axes per packet)");
+        CoreServices::sendStatusMessage("Intan: aux sequencer off");
+        return true;
+    }
+
+    IntanInterface::DeviceStatus status;
+    if (!intanInterface->getStatus(status))
+    {
+        LOGE("Aux sequencer: status read failed");
+        return false;
+    }
+    if (!status.hasAuxStatus)
+    {
+        LOGE("This firmware predates the aux sequencer (86-byte status) - "
+             "update BOOT.bin to the aux-seq-v2 build");
+        CoreServices::sendStatusMessage("Intan: firmware lacks aux sequencer");
+        return false;
+    }
+
+    // Target banks: if the sequencer is already running, write the STANDBY
+    // bank of each slot and swap - this exercises the live double-buffer +
+    // atomic packet-boundary swap. Otherwise start on bank 0.
+    int target[3];
+    for (int s = 0; s < 3; ++s)
+        target[s] = status.auxSeqEnabled ? (((status.auxBankActive >> s) & 1) ^ 1) : 0;
+
+    // Default slot programs (mirrors remote/net.py):
+    //   slot 0 (cycle 32, real-time): Reg-3 carrier - rewritten by the
+    //           override shadow every packet (digout mirror / fast settle home)
+    //   slot 1 (cycle 33, ADC): accelerometer sweep, one axis per packet
+    //   slot 2 (cycle 34, housekeeping): supply, temp, chip ID, 'INTAN' ROM
+    std::vector<uint16_t> slot0 = { IntanInterface::rhdWrite(3, 0x02) };
+    std::vector<uint16_t> slot1 = { IntanInterface::rhdConvert(32),
+                                    IntanInterface::rhdConvert(33),
+                                    IntanInterface::rhdConvert(34) };
+    std::vector<uint16_t> slot2 = { IntanInterface::rhdConvert(48),
+                                    IntanInterface::rhdConvert(49),
+                                    IntanInterface::rhdRead(63),
+                                    IntanInterface::rhdRead(62),
+                                    IntanInterface::rhdRead(40),
+                                    IntanInterface::rhdRead(41),
+                                    IntanInterface::rhdRead(42),
+                                    IntanInterface::rhdRead(43),
+                                    IntanInterface::rhdRead(44) };
+
+    if (!intanInterface->auxUploadBank(0, target[0], slot0, 0) ||
+        !intanInterface->auxUploadBank(1, target[1], slot1, 0) ||
+        !intanInterface->auxUploadBank(2, target[2], slot2, 0))
+    {
+        LOGE("Aux bank upload failed");
+        return false;
+    }
+
+    for (int s = 0; s < 3; ++s)
+    {
+        if (!intanInterface->auxBankSelect(s, target[s]))
+        {
+            LOGE("Aux bank select failed (slot ", s, ", bank ", target[s], ")");
+            return false;
+        }
+    }
+
+    if (!status.auxSeqEnabled && !intanInterface->auxSeqEnable(true))
+    {
+        LOGE("Failed to enable aux sequencer");
+        return false;
+    }
+
+    // Reset the de-interleave state to midscale until real samples arrive
+    for (int b = 0; b < 2; ++b)
+        for (int a = 0; a < 3; ++a)
+            lastAccel[b][a] = 0x8000;
+
+    auxSeqMode = true;
+    if (status.auxSeqEnabled)
+    {
+        LOGC("Aux banks reloaded LIVE via standby-bank swap (slots now on banks ",
+             target[0], "/", target[1], "/", target[2], ")");
+    }
+    else
+    {
+        LOGC("Aux sequencer enabled - accel de-interleave mode (10 kHz/axis)");
+    }
+    CoreServices::sendStatusMessage("Intan: aux sequencer active");
+    return true;
 }

@@ -95,10 +95,25 @@ public:
         std::string udpDestIp;
         uint16_t udpDestPort;
         uint32_t udpBytesSent;
-        
+
+        // Aux command sequencer status (firmware >= aux-seq-v2; 98-byte
+        // status response). hasAuxStatus is false when talking to older
+        // 86-byte firmware -- the fields below are then all zero.
+        bool hasAuxStatus;
+        bool auxSeqEnabled;       // per-packet latched aux_seq_en
+        bool fastSettleActive;    // live RHD Reg-0 D5 state
+        bool digoutState;         // live auxout mirror bit
+        bool dspResetActive;      // CONVERT bit-H forcing active
+        uint8_t auxBankActive;    // [2:0] active bank per slot
+        uint8_t auxIndex[3];      // per-slot sequence index
+        uint32_t auxReadResult;   // last injected command's response {cipo1,cipo0}
+
         // Helper methods
         std::string getFirmwareVersionString() const;
         std::string getChannelEnableString() const;
+
+        /** Multi-line human-readable dump of the full status (for console) */
+        std::string getSummary() const;
     };
     
     /**
@@ -438,6 +453,80 @@ public:
      */
     bool runFullCableTest();
     
+    // ========================================================================
+    // AUX COMMAND SEQUENCER / OVERRIDE LAYER (firmware aux-seq-v2)
+    // ========================================================================
+    //
+    // The PL can source the 3 aux COPI positions (cycles 32..34) from
+    // programmable, double-buffered command banks instead of the static
+    // table. Banks are uploadable DURING acquisition; a bank select swaps
+    // atomically at a packet boundary and the firmware confirms the swap
+    // before ACKing. When the sequencer is enabled, packets self-describe
+    // their aux contents via a command echo in header words 4/5 (see
+    // MicroZedIntanInterface docs/command-bank-design.md).
+
+    /** RHD SPI command encoders (datasheet bit layouts) */
+    static uint16_t rhdConvert(uint8_t channel, bool dspResetBit = false) {
+        return static_cast<uint16_t>(((channel & 0x3F) << 8) | (dspResetBit ? 1 : 0));
+    }
+    static uint16_t rhdWrite(uint8_t reg, uint8_t value) {
+        return static_cast<uint16_t>(0x8000 | ((reg & 0x3F) << 8) | value);
+    }
+    static uint16_t rhdRead(uint8_t reg) {
+        return static_cast<uint16_t>(0xC000 | ((reg & 0x3F) << 8));
+    }
+
+    /**
+     * @brief Upload a command program (and its length record) into one bank.
+     *
+     * @param slot 0..2 (slot 0 -> COPI cycle 32, real-time control;
+     *             slot 1 -> cycle 33, ADC/accelerometer;
+     *             slot 2 -> cycle 34, config/housekeeping)
+     * @param bank 0 or 1 (write the STANDBY bank while the other plays)
+     * @param commands 1..64 RHD command words
+     * @param loopIndex index the program wraps back to (entries before it
+     *                  play once -- a run-once preamble)
+     * @return true if all words were acknowledged
+     */
+    bool auxUploadBank(int slot, int bank, const std::vector<uint16_t>& commands,
+                       int loopIndex = 0);
+
+    /**
+     * @brief Atomically swap a slot to a bank (live, at a packet boundary).
+     * The firmware polls bank_active and only ACKs once the swap landed.
+     */
+    bool auxBankSelect(int slot, int bank);
+
+    /** @brief Enable/disable the aux command sequencer (default off). */
+    bool auxSeqEnable(bool enable);
+
+    /**
+     * @brief Configure amplifier fast settle (RHD Reg-0 D5).
+     *
+     * On a level change the PL injects WRITE(0,0xFE)/WRITE(0,0xDE) into the
+     * slot-0 command of the transition packet. Requires the aux sequencer
+     * to be enabled. Software level and GPIO trigger may be combined (OR).
+     *
+     * @param softwareLevel software fast-settle level
+     * @param gpioEnable    follow a digital_in pin as well
+     * @param gpioPin       which digital_in pin (0-7)
+     * @param dspReset      also force the CONVERT bit-H (DSP HPF reset)
+     *                      while settling is requested in software
+     */
+    bool setFastSettle(bool softwareLevel, bool gpioEnable = false,
+                       uint8_t gpioPin = 0, bool dspReset = false);
+
+    /**
+     * @brief Read an RHD register at runtime (injected via slot 2's
+     * sequencer position for exactly one packet; the loaded program is not
+     * perturbed). Requires streaming + sequencer enabled.
+     *
+     * @param reg RHD register address (0-63)
+     * @param cipo0Value chip on CIPO0's response
+     * @param cipo1Value chip on CIPO1's response
+     */
+    bool readRegister(uint8_t reg, uint16_t& cipo0Value, uint16_t& cipo1Value);
+
     // ========================================================================
     // CALLBACKS
     // ========================================================================

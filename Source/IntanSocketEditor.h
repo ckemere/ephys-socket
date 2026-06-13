@@ -105,6 +105,16 @@ private:
     std::unique_ptr<UtilityButton> rescanButton;
     std::unique_ptr<UtilityButton> debugModeButton;
     bool debugModeActive;  // Track debug mode state
+
+    // Aux sequencer test tooling (all usable DURING acquisition)
+    std::unique_ptr<UtilityButton> statusButton;      // print device status to console
+    std::unique_ptr<UtilityButton> fastSettleButton;  // toggle software fast settle
+    std::unique_ptr<UtilityButton> auxModeButton;     // toggle banked-aux/accel mode
+    bool fastSettleActive;
+    bool auxModeActive;
+
+    /** Refresh the tooling buttons' labels/colors from node state */
+    void refreshAuxButtons();
     
     // UI components
     std::unique_ptr<ChipInterface> cipo0Interface;
