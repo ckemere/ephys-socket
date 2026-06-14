@@ -14,6 +14,10 @@ generic matrix-over-TCP source with the MicroZed device protocol:
 - **UDP data** (port 5000): one packet per ~30 kHz sample; 10 header words +
   up to 70 data words depending on the channel-enable mask.
 
+<p align="center">
+  <img src="ephys-socket.png" width="80%" />
+</p>
+
 The board firmware, the `remote/net.py` reference client, and this plugin are
 the **three consumers of the same register/packet contract** — see the
 MicroZed repo when changing the protocol.
