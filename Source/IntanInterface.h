@@ -174,12 +174,20 @@ public:
         bool cipo0HasDdr;
         double cipo0Score;
         
-        // CIPO1 detection
+        // CIPO1 detection (port A)
         bool cipo1Detected;
         ChipType cipo1ChipType;
         bool cipo1HasDdr;
         double cipo1Score;
-        
+
+        // Port B detection (populated by Phase 2 per-port RESCAN; false/NONE until then)
+        bool portBCipo0Detected = false;
+        ChipType portBCipo0ChipType = ChipType::NONE;
+        bool portBCipo0HasDdr = false;
+        bool portBCipo1Detected = false;
+        ChipType portBCipo1ChipType = ChipType::NONE;
+        bool portBCipo1HasDdr = false;
+
         // All phase test results
         std::vector<PhaseTestResult> allPhaseResults;
         

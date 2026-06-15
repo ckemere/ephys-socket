@@ -777,7 +777,7 @@ void IntanSocket::setDebugMode(bool enable)
         {
             IntanSocketEditor* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
             
-            // Create a fake detection result showing 2x RHD2164 chips (64 channels each)
+            // Fake detection: 4x RHD2164 chips (2 per port, port A + port B)
             IntanInterface::AutoDetectionResult debugResult;
             debugResult.success = true;
             debugResult.chipsDetected = true;
@@ -787,6 +787,12 @@ void IntanSocket::setDebugMode(bool enable)
             debugResult.cipo1ChipType = IntanInterface::ChipType::RHD2164;
             debugResult.cipo0HasDdr = false;
             debugResult.cipo1HasDdr = false;
+            debugResult.portBCipo0Detected = true;
+            debugResult.portBCipo1Detected = true;
+            debugResult.portBCipo0ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.portBCipo1ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.portBCipo0HasDdr = false;
+            debugResult.portBCipo1HasDdr = false;
             debugResult.optimalChannelMask = 0xFF;
             debugResult.bestPhase0 = 0;
             debugResult.bestPhase1 = 0;

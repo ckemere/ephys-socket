@@ -4,62 +4,68 @@
 using namespace IntanSocketNode;
 
 // ============================================================================
-// ChipInterface Implementation
+// PortInterface Implementation
 // ============================================================================
 
-ChipInterface::ChipInterface(IntanSocket* node_, int cipoIndex_)
-    : node(node_)
-    , cipoIndex(cipoIndex_)
-    , isDetected(false)
-    , chipType(IntanInterface::ChipType::NONE)
+PortInterface::PortInterface(IntanSocket* node_, const String& portName_)
+    : node(node_), portName(portName_)
 {
-    label = (cipoIndex == 0) ? "0" : "1";
 }
 
-void ChipInterface::updateChipStatus(bool detected, IntanInterface::ChipType type)
+void PortInterface::updateCipo0Status(bool detected, IntanInterface::ChipType type)
 {
-    isDetected = detected;
-    chipType = type;
+    cipo0Detected = detected;
+    cipo0Type = type;
     repaint();
 }
 
-void ChipInterface::paint(Graphics& g)
+void PortInterface::updateCipo1Status(bool detected, IntanInterface::ChipType type)
 {
-    // Background box
-    g.setColour(findColour(ThemeColours::componentBackground).darker(0.2f));
-    g.fillRoundedRectangle(5, 0, getWidth() - 10, getHeight(), 4.0f);
-    
-    // Label
-    g.setColour(findColour(ThemeColours::defaultText));
-    g.setFont(FontOptions("Inter", "Regular", 15.0f));
-    g.drawText(label, 10, 2, 20, 15, Justification::left, false);
-    
-    // Chip indicator box
-    if (isDetected)
+    cipo1Detected = detected;
+    cipo1Type = type;
+    repaint();
+}
+
+void PortInterface::reset()
+{
+    cipo0Detected = cipo1Detected = false;
+    cipo0Type = cipo1Type = IntanInterface::ChipType::NONE;
+    repaint();
+}
+
+void PortInterface::paintChipBox(Graphics& g, int x, bool detected, IntanInterface::ChipType type)
+{
+    if (detected)
     {
-        // Orange background for detected chip
         g.setColour(Colour(255, 145, 0));
-        g.fillRoundedRectangle(23, 1, 40, 17, 3.0f);
-        
-        // Black text showing channel count
+        g.fillRoundedRectangle(x, 1, 23, 15, 3.0f);
         g.setColour(Colours::black);
-        g.setFont(FontOptions("Inter", "Bold", 12.0f));
-        String chipLabel;
-        if (chipType == IntanInterface::ChipType::RHD2164)
-            chipLabel = "64";
-        else if (chipType == IntanInterface::ChipType::RHD2132)
-            chipLabel = "32";
-        else
-            chipLabel = "??";
-            
-        g.drawText(chipLabel, 23, 1, 40, 17, Justification::centred, false);
+        g.setFont(FontOptions("Inter", "Bold", 10.0f));
+        String chipLabel = (type == IntanInterface::ChipType::RHD2164) ? "64"
+                         : (type == IntanInterface::ChipType::RHD2132) ? "32" : "??";
+        g.drawText(chipLabel, x, 1, 23, 15, Justification::centred, false);
     }
     else
     {
-        // Gray background for no chip
         g.setColour(Colour(80, 80, 80));
-        g.fillRoundedRectangle(23, 1, 40, 17, 3.0f);
+        g.fillRoundedRectangle(x, 1, 23, 15, 3.0f);
     }
+}
+
+void PortInterface::paint(Graphics& g)
+{
+    // Background
+    g.setColour(findColour(ThemeColours::componentBackground).darker(0.2f));
+    g.fillRoundedRectangle(5, 0, getWidth() - 10, getHeight(), 4.0f);
+
+    // Port letter
+    g.setColour(findColour(ThemeColours::defaultText));
+    g.setFont(FontOptions("Inter", "Bold", 13.0f));
+    g.drawText(portName, 9, 1, 14, 15, Justification::centred, false);
+
+    // Two chip boxes: CIPO0 at x=25, CIPO1 at x=50
+    paintChipBox(g, 25, cipo0Detected, cipo0Type);
+    paintChipBox(g, 50, cipo1Detected, cipo1Type);
 }
 
 // ============================================================================
@@ -168,14 +174,14 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     node = socket;
     desiredWidth = 425;
 
-    // Chip detection interfaces (CIPO0 and CIPO1)
-    cipo0Interface = std::make_unique<ChipInterface>(node, 0);
-    cipo0Interface->setBounds(3, 28, 70, 18);
-    addAndMakeVisible(cipo0Interface.get());
-    
-    cipo1Interface = std::make_unique<ChipInterface>(node, 1);
-    cipo1Interface->setBounds(3, 48, 70, 18);
-    addAndMakeVisible(cipo1Interface.get());
+    // Port A and B chip detection (each row: port letter + two CIPO boxes)
+    portAInterface = std::make_unique<PortInterface>(node, "A");
+    portAInterface->setBounds(3, 28, 76, 18);
+    addAndMakeVisible(portAInterface.get());
+
+    portBInterface = std::make_unique<PortInterface>(node, "B");
+    portBInterface->setBounds(3, 48, 76, 18);
+    addAndMakeVisible(portBInterface.get());
 
     // Connect/Disconnect buttons
     connectButton = std::make_unique<UtilityButton>(stringConnect);
@@ -374,7 +380,7 @@ void IntanSocketEditor::buttonClicked(Button* button)
         {
             debugModeButton->setLabel("DEBUG: ON");
             debugModeButton->setColour(TextButton::buttonColourId, Colours::orange.darker(0.3f));
-            CoreServices::sendStatusMessage("Intan: Debug mode enabled (128 channels)");
+            CoreServices::sendStatusMessage("Intan: Debug mode enabled (dual-port, 268 channels)");
         }
         else
         {
@@ -455,12 +461,14 @@ void IntanSocketEditor::disconnected()
     auxModeButton->setEnabledState(false);
 
     // Reset chip displays
-    cipo0Interface->updateChipStatus(false, IntanInterface::ChipType::NONE);
-    cipo1Interface->updateChipStatus(false, IntanInterface::ChipType::NONE);
+    portAInterface->reset();
+    portBInterface->reset();
 }
 
 void IntanSocketEditor::updateChipDetection(const IntanInterface::AutoDetectionResult& result)
 {
-    cipo0Interface->updateChipStatus(result.cipo0Detected, result.cipo0ChipType);
-    cipo1Interface->updateChipStatus(result.cipo1Detected, result.cipo1ChipType);
+    portAInterface->updateCipo0Status(result.cipo0Detected, result.cipo0ChipType);
+    portAInterface->updateCipo1Status(result.cipo1Detected, result.cipo1ChipType);
+    portBInterface->updateCipo0Status(result.portBCipo0Detected, result.portBCipo0ChipType);
+    portBInterface->updateCipo1Status(result.portBCipo1Detected, result.portBCipo1ChipType);
 }
