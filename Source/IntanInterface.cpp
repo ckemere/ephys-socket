@@ -1248,7 +1248,7 @@ bool IntanInterface::applyDetectionConfig(const AutoDetectionResult& result) {
 
 uint32_t IntanInterface::calculatePacketSize(uint8_t channelMask) {
     int numChannels = 0;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         if (channelMask & (1 << i)) {
             numChannels++;
         }
