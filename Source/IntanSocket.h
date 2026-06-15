@@ -131,17 +131,25 @@ private:
     /** Converts Intan data packet to Open Ephys format */
     void processDataPacket(const uint32_t* data, size_t wordCount, uint64_t timestamp);
     
-    /** Number of enabled 16-bit data streams in the mask
-        (bit0=CIPO0 reg, bit1=CIPO0 DDR, bit2=CIPO1 reg, bit3=CIPO1 DDR) */
+    /** Number of enabled 16-bit data streams in the 8-bit mask.
+        Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
+        bits 4-7 = port B (B_CIPO0_REG, B_CIPO0_DDR, B_CIPO1_REG, B_CIPO1_DDR). */
     static int countStreams(uint8_t mask) {
-        return ((mask & 0b0001) != 0) + ((mask & 0b0010) != 0)
-             + ((mask & 0b0100) != 0) + ((mask & 0b1000) != 0);
+        int n = 0;
+        for (int b = 0; b < 8; ++b)
+            n += ((mask >> b) & 1);
+        return n;
     }
 
-    /** Number of aux banks. Only the two "regular" streams (CIPO0_REG,
-        CIPO1_REG) carry aux inputs; the DDR streams just resample them. */
+    /** Number of aux banks. Only the four "regular" streams carry aux inputs
+        (the DDR streams just resample them):
+          bit 0 = A_CIPO0_REG -> aux bank 0
+          bit 2 = A_CIPO1_REG -> aux bank 1
+          bit 4 = B_CIPO0_REG -> aux bank 2
+          bit 6 = B_CIPO1_REG -> aux bank 3 */
     static int countAuxBanks(uint8_t mask) {
-        return ((mask & 0b0001) != 0) + ((mask & 0b0100) != 0);
+        return ((mask & 0b00000001) != 0) + ((mask & 0b00000100) != 0)
+             + ((mask & 0b00010000) != 0) + ((mask & 0b01000000) != 0);
     }
 
     /** Total Open Ephys channels for a mask: 32 amplifiers per stream
@@ -183,8 +191,11 @@ private:
     bool pushFastSettleConfig();
 
     /** Sample-and-hold accelerometer state for sequencer-mode de-interleave:
-        [aux bank: 0=CIPO0, 1=CIPO1][axis 0..2], raw offset-binary samples */
-    uint16_t lastAccel[2][3] = {{0x8000, 0x8000, 0x8000},
+        [aux bank: 0=A_CIPO0, 1=A_CIPO1, 2=B_CIPO0, 3=B_CIPO1][axis 0..2],
+        raw offset-binary samples */
+    uint16_t lastAccel[4][3] = {{0x8000, 0x8000, 0x8000},
+                                {0x8000, 0x8000, 0x8000},
+                                {0x8000, 0x8000, 0x8000},
                                 {0x8000, 0x8000, 0x8000}};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(IntanSocket);
