@@ -752,9 +752,10 @@ void IntanSocket::setDebugMode(bool enable)
         
         Thread::sleep(50);  // Let hardware switch to debug mode
         
-        // Step 2: Set channel enable to all channels (0x0F)
-        // This enables all 4 channel groups for maximum channel count
-        if (!intanInterface->setChannelEnable(0x0F))
+        // Step 2: Set channel enable to all streams (0xFF = port A + port B).
+        // Debug mode is synthetic, so we always request maximum bandwidth to
+        // exercise the full dual-port de-interleave path.
+        if (!intanInterface->setChannelEnable(0xFF))
         {
             LOGE("Failed to set channel enable for debug mode");
             CoreServices::sendStatusMessage("Intan: Failed to configure channels");
@@ -765,11 +766,11 @@ void IntanSocket::setDebugMode(bool enable)
         Thread::sleep(50);  // Let channel config take effect
         
         // Step 5: Update local configuration
-        channel_enable_mask = 0x0F;
-        num_channels = calculateNumChannels(channel_enable_mask);  // 4×32 + 2×3 aux
-        
+        channel_enable_mask = 0xFF;
+        num_channels = calculateNumChannels(channel_enable_mask);  // 8×32 + 4×3 aux
+
         LOGC("Debug mode enabled successfully - hardware configured for synthetic data");
-        LOGC("Channel mask: 0x0F, Channels: ", num_channels);
+        LOGC("Channel mask: 0xFF, Channels: ", num_channels);
         
         // Step 6: Update the chip display in the editor
         if (sn->getEditor() != nullptr)
@@ -786,7 +787,7 @@ void IntanSocket::setDebugMode(bool enable)
             debugResult.cipo1ChipType = IntanInterface::ChipType::RHD2164;
             debugResult.cipo0HasDdr = false;
             debugResult.cipo1HasDdr = false;
-            debugResult.optimalChannelMask = 0x0F;
+            debugResult.optimalChannelMask = 0xFF;
             debugResult.bestPhase0 = 0;
             debugResult.bestPhase1 = 0;
             
@@ -795,7 +796,7 @@ void IntanSocket::setDebugMode(bool enable)
         
         // Step 7: Update the signal chain to reflect new channel count
         CoreServices::updateSignalChain(sn->getEditor());
-        CoreServices::sendStatusMessage("Intan: Debug mode enabled (128 channels)");
+        CoreServices::sendStatusMessage("Intan: Debug mode enabled (256+12 dual-port channels)");
     }
     else
     {
