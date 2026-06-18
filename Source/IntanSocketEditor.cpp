@@ -208,15 +208,22 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     addAndMakeVisible(rescanButton.get());
     rescanButton->setVisible(false);
 
-    // Debug mode button
-    debugModeButton = std::make_unique<UtilityButton>("DEBUG MODE");
-    debugModeButton->setBounds(6, 117, 65, 18);
-    debugModeButton->addListener(this);
-    debugModeButton->setTooltip("Simulate 128 channels (2x64)");
-    addAndMakeVisible(debugModeButton.get());
-    debugModeButton->setVisible(false);
+    // Debug mode buttons: single-port (0x0F → 134 ch) vs dual-port (0xFF → 268 ch)
+    debugMode1PButton = std::make_unique<UtilityButton>("DBG 1P");
+    debugMode1PButton->setBounds(6, 117, 32, 18);
+    debugMode1PButton->addListener(this);
+    debugMode1PButton->setTooltip("Single-port debug: synthetic sine on port A only (mask 0x0F, 128 neural + 6 aux)");
+    addAndMakeVisible(debugMode1PButton.get());
+    debugMode1PButton->setVisible(false);
 
-    debugModeActive = false;
+    debugMode2PButton = std::make_unique<UtilityButton>("DBG 2P");
+    debugMode2PButton->setBounds(40, 117, 32, 18);
+    debugMode2PButton->addListener(this);
+    debugMode2PButton->setTooltip("Dual-port debug: synthetic sine on both ports (mask 0xFF, 256 neural + 12 aux)");
+    addAndMakeVisible(debugMode2PButton.get());
+    debugMode2PButton->setVisible(false);
+
+    debugModeState = DebugMode::Off;
 
     // ------------------------------------------------------------------
     // Aux sequencer test tooling (firmware aux-seq-v2). These three work
@@ -299,7 +306,8 @@ void IntanSocketEditor::startAcquisition()
     rescanButton->setEnabledState(false);
     disconnectButton->setEnabled(false);
     disconnectButton->setAlpha(0.2f);
-    debugModeButton->setEnabledState(false);
+    debugMode1PButton->setEnabledState(false);
+    debugMode2PButton->setEnabledState(false);
 }
 
 void IntanSocketEditor::stopAcquisition()
@@ -312,7 +320,8 @@ void IntanSocketEditor::stopAcquisition()
     rescanButton->setEnabledState(true);
     disconnectButton->setEnabled(true);
     disconnectButton->setAlpha(1.0f);
-    debugModeButton->setEnabledState(true);
+    debugMode1PButton->setEnabledState(true);
+    debugMode2PButton->setEnabledState(true);
 }
 
 void IntanSocketEditor::buttonClicked(Button* button)
@@ -368,27 +377,26 @@ void IntanSocketEditor::buttonClicked(Button* button)
             auxModeActive = target;
         refreshAuxButtons();
     }
-    else if (button == debugModeButton.get() && !acquisitionIsActive)
+    else if ((button == debugMode1PButton.get() || button == debugMode2PButton.get())
+             && !acquisitionIsActive)
     {
-        // Toggle the state
-        debugModeActive = !debugModeActive;
+        DebugMode target;
+        if (button == debugMode1PButton.get())
+            target = (debugModeState == DebugMode::SinglePort) ? DebugMode::Off : DebugMode::SinglePort;
+        else
+            target = (debugModeState == DebugMode::DualPort) ? DebugMode::Off : DebugMode::DualPort;
 
-        node->setDebugMode(debugModeActive);
-        
-        // Update button appearance based on state
-        if (debugModeActive)
+        if (target == DebugMode::Off)
         {
-            debugModeButton->setLabel("DEBUG: ON");
-            debugModeButton->setColour(TextButton::buttonColourId, Colours::orange.darker(0.3f));
-            CoreServices::sendStatusMessage("Intan: Debug mode enabled (dual-port, 268 channels)");
+            node->setDebugMode(false);
         }
         else
         {
-            debugModeButton->setLabel("DEBUG MODE");
-            debugModeButton->setColour(TextButton::buttonColourId, 
-                                    findColour(TextButton::buttonColourId));
-            CoreServices::sendStatusMessage("Intan: Debug mode disabled");
+            uint8_t mask = (target == DebugMode::SinglePort) ? 0x0F : 0xFF;
+            node->setDebugMode(true, mask);
         }
+        debugModeState = target;
+        refreshDebugButtons();
     }
 
 }
@@ -403,6 +411,34 @@ void IntanSocketEditor::comboBoxChanged(ComboBox* comboBox)
         int selectedId = ttlSettleCombo->getSelectedId();
         node->setFastSettleTTLPin(selectedId >= 2 ? (selectedId - 2) : -1);
         refreshAuxButtons();
+    }
+}
+
+void IntanSocketEditor::refreshDebugButtons()
+{
+    auto reset = [](UtilityButton* b, const String& lbl) {
+        b->setLabel(lbl);
+        b->setColour(TextButton::buttonColourId, b->findColour(TextButton::buttonColourId));
+    };
+    auto active = [](UtilityButton* b, const String& lbl) {
+        b->setLabel(lbl);
+        b->setColour(TextButton::buttonColourId, Colours::orange.darker(0.3f));
+    };
+
+    switch (debugModeState)
+    {
+        case DebugMode::Off:
+            reset(debugMode1PButton.get(), "DBG 1P");
+            reset(debugMode2PButton.get(), "DBG 2P");
+            break;
+        case DebugMode::SinglePort:
+            active(debugMode1PButton.get(), "1P: ON");
+            reset(debugMode2PButton.get(), "DBG 2P");
+            break;
+        case DebugMode::DualPort:
+            reset(debugMode1PButton.get(), "DBG 1P");
+            active(debugMode2PButton.get(), "2P: ON");
+            break;
     }
 }
 
@@ -443,7 +479,8 @@ void IntanSocketEditor::connected()
     connectButton->setVisible(false);
     disconnectButton->setVisible(true);
     rescanButton->setVisible(true);
-    debugModeButton->setVisible(true);
+    debugMode1PButton->setVisible(true);
+    debugMode2PButton->setVisible(true);
     statusButton->setEnabledState(true);
     fastSettleButton->setEnabledState(true);
     auxModeButton->setEnabledState(true);
@@ -455,7 +492,8 @@ void IntanSocketEditor::disconnected()
     connectButton->setVisible(true);
     disconnectButton->setVisible(false);
     rescanButton->setVisible(false);
-    debugModeButton->setVisible(true);
+    debugMode1PButton->setVisible(true);
+    debugMode2PButton->setVisible(true);
     statusButton->setEnabledState(false);
     fastSettleButton->setEnabledState(false);
     auxModeButton->setEnabledState(false);
@@ -471,4 +509,41 @@ void IntanSocketEditor::updateChipDetection(const IntanInterface::AutoDetectionR
     portAInterface->updateCipo1Status(result.cipo1Detected, result.cipo1ChipType);
     portBInterface->updateCipo0Status(result.portBCipo0Detected, result.portBCipo0ChipType);
     portBInterface->updateCipo1Status(result.portBCipo1Detected, result.portBCipo1ChipType);
+}
+
+void IntanSocketEditor::syncFromDeviceState(uint8_t mask, bool debugOn)
+{
+    // Channel-enable bits, by lane:
+    //   port A: bit0=A.CIPO0_REG, bit1=A.CIPO0_DDR, bit2=A.CIPO1_REG, bit3=A.CIPO1_DDR
+    //   port B: bit4..bit7 same order
+    // A lane is "detected" if its REG bit is set. RHD2164 has DDR (REG+DDR),
+    // RHD2132 does not (REG only). This is the same shape a successful RESCAN
+    // leaves the firmware in, so adopting it at reconnect is lossless.
+    auto laneFromBits = [](uint8_t m, int regBit, int ddrBit)
+        -> std::pair<bool, IntanInterface::ChipType>
+    {
+        bool reg = (m & (1 << regBit)) != 0;
+        bool ddr = (m & (1 << ddrBit)) != 0;
+        if (!reg) return { false, IntanInterface::ChipType::NONE };
+        return { true, ddr ? IntanInterface::ChipType::RHD2164
+                           : IntanInterface::ChipType::RHD2132 };
+    };
+
+    auto a0 = laneFromBits(mask, 0, 1);
+    auto a1 = laneFromBits(mask, 2, 3);
+    auto b0 = laneFromBits(mask, 4, 5);
+    auto b1 = laneFromBits(mask, 6, 7);
+
+    portAInterface->updateCipo0Status(a0.first, a0.second);
+    portAInterface->updateCipo1Status(a1.first, a1.second);
+    portBInterface->updateCipo0Status(b0.first, b0.second);
+    portBInterface->updateCipo1Status(b1.first, b1.second);
+
+    // Debug-button state. Pick the closer of single-port / dual-port based on
+    // whether the high nibble is set; that's enough to label DBG 1P / DBG 2P
+    // correctly.
+    if (!debugOn)                       debugModeState = DebugMode::Off;
+    else if ((mask & 0xF0) != 0)        debugModeState = DebugMode::DualPort;
+    else                                debugModeState = DebugMode::SinglePort;
+    refreshDebugButtons();
 }

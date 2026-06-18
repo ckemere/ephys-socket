@@ -86,7 +86,10 @@ public:
     bool applyDetectionConfig(const IntanInterface::AutoDetectionResult& result);
 
     /** Debug mode is useful for testing. **/
-    void setDebugMode(bool enable);
+    /** Enable/disable debug mode. When enabling, mask selects single-port
+        (0x0F → 4 streams, 134 channels) or dual-port (0xFF → 8 streams,
+        268 channels) synthetic data. Ignored when disabling. */
+    void setDebugMode(bool enable, uint8_t mask = 0xFF);
     bool isDebugMode() const { return debugMode; }
 
     // ------------------------------------------------------------------

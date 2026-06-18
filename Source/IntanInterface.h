@@ -374,7 +374,19 @@ public:
      * @return true if command succeeded
      */
     bool setPhaseSelect(uint8_t phase0, uint8_t phase1);
-    
+
+    /**
+     * @brief Set CIPO phase delay compensation for port B (second cable)
+     *
+     * Port B has independent phase delays. On firmware without dual-port
+     * support, this returns false and has no effect.
+     *
+     * @param phase2 Phase delay for port B CIPO0 (0-15)
+     * @param phase3 Phase delay for port B CIPO1 (0-15)
+     * @return true if command succeeded
+     */
+    bool setPhaseSelectB(uint8_t phase2, uint8_t phase3);
+
     /**
      * @brief Enable or disable debug mode
      * 

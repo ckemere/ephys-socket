@@ -137,23 +137,13 @@ bool IntanSocket::connectDevice(bool printOutput)
             return false;
         }
 
-        // CRITICAL: Configure channel enable BEFORE getting status
-        // Firmware defaults to 0x0, we want all 4 channels
-        if (!intanInterface->setChannelEnable(0x0F)) {
-            LOGE("Failed to set channel enable");
-            intanInterface.reset();
-            return false;
-        }
-        
-        Thread::sleep(100);  // Let it take effect
-        
         // Set up data callback
         intanInterface->setDataCallback(
             [this](const uint32_t* data, size_t words, uint64_t timestamp) {
                 processDataPacket(data, words, timestamp);
             }
         );
-        
+
         // Set up error callback
         intanInterface->setErrorCallback(
             [this, printOutput](const std::string& error) {
@@ -164,22 +154,46 @@ bool IntanSocket::connectDevice(bool printOutput)
                 hasError = true;
             }
         );
-        
-        // Get device status to determine channel configuration
+
+        // Pull authoritative state from the device. The firmware retains the
+        // channel-enable mask, debug mode, phase delays, and aux-sequencer
+        // state across plugin disconnects (they live in PL registers, no NVM
+        // but they survive the lifetime of the firmware). Adopt whatever the
+        // device is in and let the editor mirror it. After any successful
+        // RESCAN, reconnecting restores the prior chip indicators and channel
+        // count without re-running detection.
+        //
+        // Exception: if the firmware just booted, channel_enable=0 (no streams
+        // configured yet). Publishing a 0-channel DataStream crashes downstream
+        // plugins on the next updateSignalChain (LFP Viewer dereferences a
+        // null stream in saveParameters). Seed the firmware with 0x0F so the
+        // signal chain has *something* valid -- the chip indicators still stay
+        // dark because no real RESCAN has happened, so the user is prompted to
+        // RESCAN in the obvious way.
         IntanInterface::DeviceStatus status;
         if (intanInterface->getStatus(status))
         {
+            if (status.channelEnable == 0)
+            {
+                intanInterface->setChannelEnable(0x0F);
+                Thread::sleep(10);
+                intanInterface->getStatus(status);  // re-read so we log what we set
+            }
+
             channel_enable_mask = status.channelEnable;
             num_channels = calculateNumChannels(channel_enable_mask);
+            debugMode = (status.debugMode != 0);
 
-            // Sync local aux-sequencer state with the device (it persists
-            // across plugin reconnects)
-            auxSeqMode = status.hasAuxStatus && status.auxSeqEnabled;
+            // Aux sequencer state (already persisted across reconnect)
+            auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
             fastSettleSw = status.hasAuxStatus && status.fastSettleActive;
 
             if (printOutput)
             {
-                LOGC("Connected to Intan device - ", num_channels, " channels active");
+                LOGC("Connected to Intan device - mask 0x",
+                     String::toHexString((int)channel_enable_mask),
+                     " (", num_channels, " channels), debug=",
+                     debugMode ? "ON" : "OFF");
                 LOGC("Firmware: ", status.getFirmwareVersionString().c_str());
                 CoreServices::sendStatusMessage("Intan: Connected successfully.");
             }
@@ -188,7 +202,15 @@ bool IntanSocket::connectDevice(bool printOutput)
         getParameter("device_ip")->setEnabled(false);
 
         if (sn->getEditor() != nullptr)
-            static_cast<IntanSocketEditor*>(sn->getEditor())->connected();
+        {
+            auto* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
+            editor->connected();
+            // Mirror the device's persisted state into the UI (chip indicators
+            // from channel_enable, DBG button label from debug_mode). On a fresh
+            // boot mask=0 -> no chips shown -> user clicks RESCAN. On reconnect
+            // after a previous RESCAN, the prior indicators come back for free.
+            editor->syncFromDeviceState(channel_enable_mask, debugMode);
+        }
 
         return true;
     }
@@ -540,6 +562,31 @@ bool IntanSocket::updateBuffer()
     int streamBits[8];
     int nStreams = 0;
     for (int b = 0; b < 8; ++b)
+    {
+        if (channel_enable_mask & (1 << b))
+            streamBits[nStreams++] = b;
+    }
+
+    // One-shot diagnostic: print the actual runtime sizes the first packet of
+    // each acquisition. If numDataWords < 140 or nStreams != 8 at 0xFF, the
+    // packet size pipeline is broken somewhere — do NOT remove until verified.
+    {
+        static uint32_t lastReportedMask = 0;
+        if (channel_enable_mask != lastReportedMask)
+        {
+            lastReportedMask = channel_enable_mask;
+            LOGC("[ephys-socket diag] mask=0x", String::toHexString((int)channel_enable_mask),
+                 " nStreams=", nStreams,
+                 " packet.data.size=", (int)packet.data.size(),
+                 " numDataWords=", (int)numDataWords,
+                 " num_channels=", num_channels);
+        }
+    }
+
+    // Re-scan (the loop above was moved up so we can report nStreams);
+    // this second pass is a no-op but kept for clarity of the original flow.
+    nStreams = 0;
+    for (int b = 0; b < 8; ++b)
         if (channel_enable_mask & (1 << b))
             streamBits[nStreams++] = b;
 
@@ -720,18 +767,20 @@ bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult
     
     return true;
 }
-void IntanSocket::setDebugMode(bool enable)
+void IntanSocket::setDebugMode(bool enable, uint8_t mask)
 {
     debugMode = enable;
-    
+
     if (debugMode)
     {
         // ====================================================================
         // ENABLE DEBUG MODE
         // ====================================================================
-        
-        LOGC("Enabling debug mode - simulating 128 channels (2x64)");
-        
+
+        bool dualPort = (mask & 0xF0) != 0;
+        LOGC("Enabling debug mode - mask 0x", String::toHexString((int)mask),
+             dualPort ? " (dual-port 268ch)" : " (single-port 134ch)");
+
         // Check if we have a connection to the hardware
         if (!intanInterface || !intanInterface->isReady())
         {
@@ -740,7 +789,7 @@ void IntanSocket::setDebugMode(bool enable)
             debugMode = false;
             return;
         }
-        
+
         // Step 1: Send hardware debug mode enable command (0x12 SET_DEBUG_MODE)
         if (!intanInterface->setDebugMode(true))
         {
@@ -749,60 +798,62 @@ void IntanSocket::setDebugMode(bool enable)
             debugMode = false;
             return;
         }
-        
+
         Thread::sleep(50);  // Let hardware switch to debug mode
-        
-        // Step 2: Set channel enable to all streams (0xFF = port A + port B).
-        // Debug mode is synthetic, so we always request maximum bandwidth to
-        // exercise the full dual-port de-interleave path.
-        if (!intanInterface->setChannelEnable(0xFF))
+
+        // Step 2: Apply the requested channel-enable mask.
+        if (!intanInterface->setChannelEnable(mask))
         {
             LOGE("Failed to set channel enable for debug mode");
             CoreServices::sendStatusMessage("Intan: Failed to configure channels");
             debugMode = false;
             return;
         }
-        
-        Thread::sleep(50);  // Let channel config take effect
-        
-        // Step 5: Update local configuration
-        channel_enable_mask = 0xFF;
-        num_channels = calculateNumChannels(channel_enable_mask);  // 8×32 + 4×3 aux
 
-        LOGC("Debug mode enabled successfully - hardware configured for synthetic data");
-        LOGC("Channel mask: 0xFF, Channels: ", num_channels);
-        
+        Thread::sleep(50);  // Let channel config take effect
+
+        // Step 5: Update local configuration
+        channel_enable_mask = mask;
+        num_channels = calculateNumChannels(channel_enable_mask);
+
+        LOGC("Debug mode enabled - mask 0x", String::toHexString((int)mask),
+             ", channels=", num_channels);
+
         // Step 6: Update the chip display in the editor
         if (sn->getEditor() != nullptr)
         {
             IntanSocketEditor* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
-            
-            // Fake detection: 4x RHD2164 chips (2 per port, port A + port B)
+
+            // Fake detection result mirroring the requested mask. Port A is
+            // lit whenever any of the low-nibble bits are on; port B only
+            // when the high nibble is on.
             IntanInterface::AutoDetectionResult debugResult;
             debugResult.success = true;
             debugResult.chipsDetected = true;
-            debugResult.cipo0Detected = true;
-            debugResult.cipo1Detected = true;
-            debugResult.cipo0ChipType = IntanInterface::ChipType::RHD2164;
-            debugResult.cipo1ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.cipo0Detected = (mask & 0x01) != 0;
+            debugResult.cipo1Detected = (mask & 0x04) != 0;
+            debugResult.cipo0ChipType = debugResult.cipo0Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
+            debugResult.cipo1ChipType = debugResult.cipo1Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
             debugResult.cipo0HasDdr = false;
             debugResult.cipo1HasDdr = false;
-            debugResult.portBCipo0Detected = true;
-            debugResult.portBCipo1Detected = true;
-            debugResult.portBCipo0ChipType = IntanInterface::ChipType::RHD2164;
-            debugResult.portBCipo1ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.portBCipo0Detected = (mask & 0x10) != 0;
+            debugResult.portBCipo1Detected = (mask & 0x40) != 0;
+            debugResult.portBCipo0ChipType = debugResult.portBCipo0Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
+            debugResult.portBCipo1ChipType = debugResult.portBCipo1Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
             debugResult.portBCipo0HasDdr = false;
             debugResult.portBCipo1HasDdr = false;
-            debugResult.optimalChannelMask = 0xFF;
+            debugResult.optimalChannelMask = mask;
             debugResult.bestPhase0 = 0;
             debugResult.bestPhase1 = 0;
-            
+
             editor->updateChipDetection(debugResult);
         }
-        
+
         // Step 7: Update the signal chain to reflect new channel count
         CoreServices::updateSignalChain(sn->getEditor());
-        CoreServices::sendStatusMessage("Intan: Debug mode enabled (256+12 dual-port channels)");
+        CoreServices::sendStatusMessage(dualPort
+            ? "Intan: Debug mode enabled (dual-port, 268 channels)"
+            : "Intan: Debug mode enabled (single-port, 134 channels)");
     }
     else
     {
@@ -886,6 +937,22 @@ void IntanSocket::printDeviceStatus()
     std::string line;
     while (std::getline(iss, line))
         LOGC(line);
+
+    // Plugin-side reception stats. These tell us whether UDP packets are being
+    // lost (timestampErrors), arriving with wrong size (sizeErrors), or with
+    // a bad magic header (magicErrors). A growing timestampErrors with a stable
+    // packetsReceived from the device == packet drops between firmware and host
+    // (network or BRAM ring overrun). Growing PL fifoCount or PS errorCount in
+    // the device status == firmware can't keep up with PL writes.
+    IntanInterface::ReceptionStats rx;
+    intanInterface->getReceptionStats(rx);
+    LOGC("--- Plugin Reception ---");
+    LOGC("Packets recv: ", (int64)rx.totalPackets,
+         "  totalErr: ", (int64)rx.totalErrors,
+         "  magicErr: ", (int64)rx.magicErrors,
+         "  tsErr: ", (int64)rx.timestampErrors,
+         "  sizeErr: ", (int64)rx.sizeErrors);
+    LOGC("Rate: ", rx.instantRate, " pkt/s (", rx.dataRateMbps, " Mbps)");
 
     CoreServices::sendStatusMessage("Intan: status printed to console");
 }

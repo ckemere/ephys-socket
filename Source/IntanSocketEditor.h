@@ -103,13 +103,21 @@ public:
     /** Update chip detection display */
     void updateChipDetection(const IntanInterface::AutoDetectionResult& result);
 
+    /** Sync editor state from the device's status response. Called on connect
+        so the UI snaps to whatever the firmware is already configured for
+        (channel-enable mask + debug mode), without forcing a RESCAN. */
+    void syncFromDeviceState(uint8_t channelMask, bool debugOn);
+
 private:
     // Buttons
     std::unique_ptr<UtilityButton> connectButton;
     std::unique_ptr<UtilityButton> disconnectButton;
     std::unique_ptr<UtilityButton> rescanButton;
-    std::unique_ptr<UtilityButton> debugModeButton;
-    bool debugModeActive;  // Track debug mode state
+    std::unique_ptr<UtilityButton> debugMode1PButton;   // single-port (0x0F)
+    std::unique_ptr<UtilityButton> debugMode2PButton;   // dual-port (0xFF)
+    enum class DebugMode { Off, SinglePort, DualPort };
+    DebugMode debugModeState = DebugMode::Off;
+    void refreshDebugButtons();
 
     // Aux sequencer test tooling (all usable DURING acquisition)
     std::unique_ptr<UtilityButton> statusButton;      // print device status to console
