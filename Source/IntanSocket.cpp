@@ -964,9 +964,13 @@ bool IntanSocket::pushFastSettleConfig()
     if (!intanInterface)
         return false;
     bool gpioEn = fastSettleTTL >= 0;
+    // Default: amplifier fast settle (RHD Reg-0 D5) and DSP reset (CONVERT
+    // bit-H) follow the SAME trigger -- both the SETTLE button's software
+    // level and the TTL Settle pin. Configurability for independent DSP
+    // triggering can be added later.
     return intanInterface->setFastSettle(fastSettleSw, gpioEn,
                                          gpioEn ? (uint8_t)fastSettleTTL : 0,
-                                         false /* no DSP reset by default */);
+                                         true /* DSP follows fast settle */);
 }
 
 void IntanSocket::setManualFastSettle(bool active)

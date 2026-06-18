@@ -465,7 +465,12 @@ public:
                        bool dspReset) {
         uint32_t p1 = (softwareLevel ? 1 : 0) | (gpioEnable ? 2 : 0)
                     | ((uint32_t)(gpioPin & 7) << 4);
-        uint32_t p2 = (dspReset && softwareLevel) ? 1 : 0;  // DSP follows the SW level
+        // When dspReset is requested, mirror the *entire* fast-settle config
+        // into the DSP fields (same layout: bit0 = SW, bit1 = GPIO_EN, [6:4] =
+        // pin sel). That way the DSP reset (CONVERT bit-H force) follows the
+        // exact same trigger as the amplifier fast settle -- both fire together
+        // on the SW level or the selected digital_in pin.
+        uint32_t p2 = dspReset ? p1 : 0;
         return sendCommand(CMD_SET_FAST_SETTLE, p1, p2);
     }
 
