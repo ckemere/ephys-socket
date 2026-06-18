@@ -286,6 +286,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
         ttlSettleCombo->addItem("TTL" + String(1 + k), 2 + k);
     }
     ttlSettleCombo->setSelectedId(1, dontSendNotification);
+    ttlSettleCombo->setEnabled(false);   // enabled only when connected
     addAndMakeVisible(ttlSettleCombo.get());
     
     // Add parameter editors for IP/ports on the right side
@@ -485,6 +486,18 @@ void IntanSocketEditor::connected()
     fastSettleButton->setEnabledState(true);
     auxModeButton->setEnabledState(true);
     refreshAuxButtons();   // sync with device state (persists across reconnect)
+
+    // Pull the TTL fast-settle pin from the device (aux_ctrl readback,
+    // firmware 65d5fb5+) so the combo reflects whatever is actually live --
+    // a reconnect after a previous configuration restores the prior pin for
+    // free, no spurious write needed. On older firmware (no aux_ctrl field),
+    // the node falls back to pushing the combo's current selection.
+    ttlSettleCombo->setEnabled(true);
+    int devicePin = node->getDeviceTTLFastSettlePin();   // -1 = off, 0..7 = pin
+    if (devicePin >= 0)
+        ttlSettleCombo->setSelectedId(devicePin + 2, dontSendNotification);
+    else
+        ttlSettleCombo->setSelectedId(1, dontSendNotification);  // "-"
 }
 
 void IntanSocketEditor::disconnected()
@@ -497,6 +510,12 @@ void IntanSocketEditor::disconnected()
     statusButton->setEnabledState(false);
     fastSettleButton->setEnabledState(false);
     auxModeButton->setEnabledState(false);
+
+    // TTL Settle combo: disable while disconnected and reset to "-" so a
+    // future reconnect can't silently re-enable the TTL trigger on a freshly
+    // booted board.
+    ttlSettleCombo->setEnabled(false);
+    ttlSettleCombo->setSelectedId(1, dontSendNotification);
 
     // Reset chip displays
     portAInterface->reset();

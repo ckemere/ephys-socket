@@ -186,7 +186,21 @@ bool IntanSocket::connectDevice(bool printOutput)
 
             // Aux sequencer state (already persisted across reconnect)
             auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
-            fastSettleSw = status.hasAuxStatus && status.fastSettleActive;
+
+            // Fast-settle / TTL state: prefer the new aux_ctrl readback
+            // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
+            // pin select. On older firmware, fall back to the live fs_active
+            // bit (SW state isn't directly observable) and assume no TTL pin.
+            if (status.hasAuxCtrl)
+            {
+                fastSettleSw  = status.fsSwLevel;
+                fastSettleTTL = status.fsGpioEn ? (int)status.fsGpioPin : -1;
+            }
+            else
+            {
+                fastSettleSw  = status.hasAuxStatus && status.fastSettleActive;
+                fastSettleTTL = -1;
+            }
 
             if (printOutput)
             {

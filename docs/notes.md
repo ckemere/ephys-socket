@@ -63,10 +63,23 @@ pick the parse mode, so it stays correct through live bank swaps:
 The AUX channel count and packet size are identical in both modes, so no
 signal-chain rebuild is needed when toggling.
 
-Status responses are 122 bytes on firmware ≥ 1.1.0.0; the plugin also accepts
-the 98-byte aux-seq-v2 form and the 86-byte pre-aux form (aux features then
-report "not supported"). The buffer is sized to the largest known form so a
-firmware response never sits unread in the TCP queue.
+Status response sizes grow over time. Current firmware sends **148 bytes**;
+the plugin accepts every prior size and decodes optional fields based on
+what the device actually sent:
+
+| Size | Firmware | Added |
+|---|---|---|
+| 86 | pre-aux | base config + UDP info |
+| 98 | aux-seq-v2 | aux sequencer block (`auxSeqEnabled`, `fastSettleActive`, ...) |
+| 122 | fw 1.1.0.0 | DMA / perf instrumentation (skipped by the plugin) |
+| 126 | `65d5fb5` | **`aux_ctrl`** — CTRL_REG_22 readback: SW level, GPIO_EN, pin select for each of fast settle / DSP reset / digout, plus Reg-3 static |
+| 148 | `7fb41dc` | **`rhd_reg[22]`** — RHD chip register shadow (commanded state of regs 0..21) |
+
+The plugin sizes its buffer to the largest known form (148) so an unread
+suffix never sits in the TCP queue corrupting the next command's ACK. The
+`aux_ctrl` field is what lets the editor pull the TTL Settle combo from
+the device on connect instead of pushing -- a reconnect after a prior
+configuration restores the prior pin for free.
 
 The authoritative protocol documentation lives in the MicroZedIntanInterface
 repo: `docs/command-bank-design.md` (design), `docs/NIGHT_LOG-2026-06-11.md`

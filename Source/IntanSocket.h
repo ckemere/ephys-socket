@@ -115,6 +115,12 @@ public:
         with the software level in the PL. */
     void setFastSettleTTLPin(int pin);
 
+    /** The device's CURRENT TTL fast-settle pin selection (-1 = off, 0..7 =
+        digital_in pin). Reads back from the cached aux_ctrl status field
+        (firmware 65d5fb5+). Returns the locally tracked fastSettleTTL value
+        on older firmware that doesn't surface it. */
+    int getDeviceTTLFastSettlePin() const { return fastSettleTTL; }
+
     /** Switch the aux COPI slots to the banked sequencer programs
         (accelerometer sweep on slot 1 -> one axis per packet, de-interleaved
         here via the packet command echo). Toggling while acquiring uploads

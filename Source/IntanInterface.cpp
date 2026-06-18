@@ -40,15 +40,35 @@ namespace {
     constexpr uint32_t PACKET_MAGIC_HIGH = 0xCAFEBABE;
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
-    // Firmware status response has grown twice:
-    //  86  bytes  = pre-aux firmware
-    //  98  bytes  = aux-seq-v2 firmware (adds aux sequencer block)
-    //  122 bytes  = aux-seq-v2 + DMA/perf instrumentation (current)
+    // Firmware status response has grown over time:
+    //   86  bytes  pre-aux firmware
+    //   98  bytes  aux-seq-v2 (aux sequencer block)
+    //  122  bytes  + DMA/perf instrumentation (fw 1.1.0.0)
+    //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
+    //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
     // The buffer must be sized to the largest known form, or extra bytes will
-    // sit unread in the TCP queue and corrupt the next command's ACK.
-    constexpr size_t STATUS_RESPONSE_SIZE = 122;
+    // sit unread in the TCP queue and corrupt the next command's ACK. The
+    // parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and decodes
+    // optional fields based on what the device actually sent.
+    constexpr size_t STATUS_RESPONSE_SIZE = 148;
+    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
+    constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
+    constexpr size_t STATUS_RESPONSE_SIZE_PERF = 122;
     constexpr size_t STATUS_RESPONSE_SIZE_AUX = 98;
     constexpr size_t STATUS_RESPONSE_SIZE_LEGACY = 86;
+
+    // CTRL_REG_AUX_CTRL bit layout (mirrors firmware/include/main.h).
+    constexpr uint32_t AUX_CTRL_SEQ_EN              = 1u << 0;
+    constexpr uint32_t AUX_CTRL_FS_SW               = 1u << 4;
+    constexpr uint32_t AUX_CTRL_FS_GPIO_EN          = 1u << 5;
+    constexpr int      AUX_CTRL_FS_GPIO_SEL_SHIFT   = 6;
+    constexpr uint32_t AUX_CTRL_DSP_SW              = 1u << 9;
+    constexpr uint32_t AUX_CTRL_DSP_GPIO_EN         = 1u << 10;
+    constexpr int      AUX_CTRL_DSP_GPIO_SEL_SHIFT  = 11;
+    constexpr uint32_t AUX_CTRL_DIGOUT_SW           = 1u << 14;
+    constexpr uint32_t AUX_CTRL_DIGOUT_GPIO_EN      = 1u << 15;
+    constexpr int      AUX_CTRL_DIGOUT_GPIO_SEL_SHIFT = 16;
+    constexpr int      AUX_CTRL_REG3_STATIC_SHIFT   = 24;
 
     // Command IDs
     enum CommandId : uint32_t {
@@ -350,8 +370,10 @@ public:
             return false;
         }
 
-        // Accept any of the three known sizes (see STATUS_RESPONSE_SIZE comment).
-        if (dataLen != STATUS_RESPONSE_SIZE &&
+        // Accept any of the known sizes (see STATUS_RESPONSE_SIZE comment).
+        if (dataLen != STATUS_RESPONSE_SIZE_RHD &&
+            dataLen != STATUS_RESPONSE_SIZE_AUXCTRL &&
+            dataLen != STATUS_RESPONSE_SIZE_PERF &&
             dataLen != STATUS_RESPONSE_SIZE_AUX &&
             dataLen != STATUS_RESPONSE_SIZE_LEGACY) {
             return false;
@@ -421,7 +443,47 @@ public:
             status.auxIndex[0] = *p++;
             status.auxIndex[1] = *p++;
             status.auxIndex[2] = *p++;
-            // 3 reserved bytes follow
+            p += 3;  // 3 reserved bytes
+        }
+
+        // DMA / perf instrumentation block (firmware 1.1.0.0+, status >= 122)
+        // -- we don't expose the fields in DeviceStatus yet, just skip past.
+        if (dataLen >= STATUS_RESPONSE_SIZE_PERF) {
+            p += 24;
+        }
+
+        // CTRL_REG_22 (aux_ctrl) readback (firmware 65d5fb5+, status >= 126).
+        // Decode the fast-settle / DSP / digout config so the editor can sync
+        // its TTL combo to whatever the device is actually in.
+        status.hasAuxCtrl = false;
+        status.auxCtrlRaw = 0;
+        status.fsSwLevel = status.fsGpioEn = false;     status.fsGpioPin = 0;
+        status.dspSwLevel = status.dspGpioEn = false;   status.dspGpioPin = 0;
+        status.digoutSwLevel = status.digoutGpioEn = false; status.digoutGpioPin = 0;
+        status.reg3Static = 0;
+        if (dataLen >= STATUS_RESPONSE_SIZE_AUXCTRL) {
+            uint32_t auxCtrl = unpackU32LE(p); p += 4;
+            status.hasAuxCtrl = true;
+            status.auxCtrlRaw = auxCtrl;
+            status.fsSwLevel     = (auxCtrl & AUX_CTRL_FS_SW) != 0;
+            status.fsGpioEn      = (auxCtrl & AUX_CTRL_FS_GPIO_EN) != 0;
+            status.fsGpioPin     = (auxCtrl >> AUX_CTRL_FS_GPIO_SEL_SHIFT) & 0x7;
+            status.dspSwLevel    = (auxCtrl & AUX_CTRL_DSP_SW) != 0;
+            status.dspGpioEn     = (auxCtrl & AUX_CTRL_DSP_GPIO_EN) != 0;
+            status.dspGpioPin    = (auxCtrl >> AUX_CTRL_DSP_GPIO_SEL_SHIFT) & 0x7;
+            status.digoutSwLevel = (auxCtrl & AUX_CTRL_DIGOUT_SW) != 0;
+            status.digoutGpioEn  = (auxCtrl & AUX_CTRL_DIGOUT_GPIO_EN) != 0;
+            status.digoutGpioPin = (auxCtrl >> AUX_CTRL_DIGOUT_GPIO_SEL_SHIFT) & 0x7;
+            status.reg3Static    = (auxCtrl >> AUX_CTRL_REG3_STATIC_SHIFT) & 0xFF;
+        }
+
+        // RHD chip register mirror (firmware 7fb41dc+, status == 148).
+        status.hasRhdRegMirror = false;
+        std::memset(status.rhdReg, 0, sizeof(status.rhdReg));
+        if (dataLen >= STATUS_RESPONSE_SIZE_RHD) {
+            std::memcpy(status.rhdReg, p, 22);
+            p += 22;
+            status.hasRhdRegMirror = true;
         }
 
         return true;

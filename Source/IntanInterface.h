@@ -108,6 +108,32 @@ public:
         uint8_t auxIndex[3];      // per-slot sequence index
         uint32_t auxReadResult;   // last injected command's response {cipo1,cipo0}
 
+        // CTRL_REG_22 readback (firmware 65d5fb5+, status >= 126 bytes). When
+        // hasAuxCtrl is true, the host can read back the FULL fast-settle /
+        // DSP / digout configuration -- including the GPIO pin select -- and
+        // so the editor can sync its TTL combo to whatever the device is in.
+        bool hasAuxCtrl;
+        uint32_t auxCtrlRaw;       // raw CTRL_REG_22 (for re-decoding if needed)
+        bool fsSwLevel;            // amp fast settle: software level bit
+        bool fsGpioEn;             // amp fast settle: GPIO trigger enable
+        uint8_t fsGpioPin;         // amp fast settle: digital_in pin select [2:0]
+        bool dspSwLevel;           // DSP reset: software level bit
+        bool dspGpioEn;            // DSP reset: GPIO trigger enable
+        uint8_t dspGpioPin;        // DSP reset: digital_in pin select [2:0]
+        bool digoutSwLevel;        // digout: software level bit
+        bool digoutGpioEn;         // digout: GPIO trigger enable
+        uint8_t digoutGpioPin;     // digout: digital_in pin select [2:0]
+        uint8_t reg3Static;        // RHD Reg-3 static (host-owned bits D7..D1)
+
+        // RHD chip register shadow (firmware 7fb41dc+, status == 148 bytes).
+        // Commanded state of regs 0..21, seeded from the init sequence and
+        // updated on WRITE_REGISTER. Regs 0 and 3 are owned by the PL
+        // override layer -- their LIVE values are in aux_ctrl/aux_flags, the
+        // shadow keeps the init base for those two. hasRhdRegMirror is false
+        // on older firmware; rhdReg[] is then zero.
+        bool hasRhdRegMirror;
+        uint8_t rhdReg[22];
+
         // Helper methods
         std::string getFirmwareVersionString() const;
         std::string getChannelEnableString() const;
