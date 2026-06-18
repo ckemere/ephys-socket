@@ -74,8 +74,7 @@ repo: `docs/command-bank-design.md` (design), `docs/NIGHT_LOG-2026-06-11.md`
 
 ## Channel scaling and data storage
 
-Scaling matches the OpenEphys **acquisition-board plugin** exactly. Every
-sample is published into the GUI data buffer as:
+Every sample is published into the GUI data buffer as:
 
 ```
 buffer_value = (raw_adc_count - 32768) * bitVolts
@@ -83,15 +82,25 @@ buffer_value = (raw_adc_count - 32768) * bitVolts
 
 and the **same `bitVolts`** is declared on the channel:
 
-| Channel type | bitVolts | buffer units | units label |
-|---|---|---|---|
-| ELECTRODE (neural) | `0.195` | µV | `uV` |
-| AUX (auxin1/2/3, e.g. accelerometer) | `0.0000374` | — | `mV` |
+| Channel type | bitVolts | buffer units | units label | nominal range |
+|---|---|---|---|---|
+| ELECTRODE (neural) | `0.195` | µV | `uV` | viewer default |
+| AUX (auxin1/2/3, e.g. accelerometer) | `1.0` | raw signed ADC count | `a.u.` | ±32768 |
 
 The `- 32768` decodes the chip's offset-binary samples to a signed value
-around zero; it is a constant, reversible representation choice (the same one
-the acquisition board makes), **not** a baseline subtraction or detrend — no
-acquired information is altered or lost.
+around zero; it is a constant, reversible representation choice, **not** a
+baseline subtraction or detrend — no acquired information is altered or lost.
+
+For neural channels, `bitVolts = 0.195` µV/LSB gives a buffer value in
+microvolts, matching the OpenEphys acquisition-board plugin.
+
+For aux channels, `bitVolts = 1.0` deliberately leaves the value as the raw
+signed ADC count and the channel is labelled `a.u.` (arbitrary units). The
+LFP viewer's range selector then offers the natural ±32768 window plus
+zoom-in subdivisions for the small-amplitude regime where typical
+accelerometer / supply-rail signals live. A reader who wants physical units
+can apply the chip's data-sheet conversion: 1 LSB ≈ 2.45 V / 65536 = 37.4 µV
+at the RHD aux input.
 
 ### What this means for recordings
 
@@ -106,13 +115,16 @@ int16_on_disk = (raw - 32768)
 
 So the recording stores the **exact signed ADC count** (`raw - 32768`, range
 −32768…+32767 — precisely the int16 range, so it never clips), and the
-`bit_volts` field in `structure.oebin` lets any reader reconstruct the physical
-value as `int16 * bit_volts`. The stored data is a lossless representation of
-the raw acquired counts.
+`bit_volts` field in `structure.oebin` lets any reader reconstruct a physical
+value as `int16 * bit_volts`. For aux channels that physical value is the same
+signed integer (bitVolts = 1.0); for neural channels it's microvolts.
+
+The stored data is a lossless representation of the raw acquired counts.
 
 > Note: this differs from earlier revisions of this plugin, which wrote raw
 > counts into the buffer while declaring a `bitVolts` ≠ 1. That displayed
-> amplitudes ~5× off and made `int16 = raw / bitVolts` overflow the int16
-> range, clipping large transients in the recording. The current scaling fixes
-> both, at the cost of changing the recorded values relative to those
-> revisions — re-derive any amplitude thresholds tuned against the old output.
+> amplitudes ~5× off (neural) or ~1000× off (aux, V/LSB silently labelled mV)
+> and made `int16 = raw / bitVolts` overflow the int16 range, clipping large
+> transients in the recording. The current scaling fixes both, at the cost of
+> changing the recorded values relative to those revisions — re-derive any
+> amplitude thresholds tuned against the old output.

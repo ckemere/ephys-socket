@@ -355,10 +355,12 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
             };
 
             continuousChannels->add (new ContinuousChannel (channelSettings));
-            // Match the acquisition-board plugin's AUX metadata so the LFP
-            // viewer ranges these the same way (mV-denominated AUX ranges).
-            continuousChannels->getLast()->setUnits ("mV");
-            continuousChannels->getLast()->inputRange = {-100.0f, 100.0f};
+            // Aux samples are published as raw signed ADC counts (bitVolts=1.0);
+            // expose them in arbitrary units with a range that covers the full
+            // signed-16-bit window. Accelerometer signals sit well inside this,
+            // and the LFP viewer's range selector zooms in from there.
+            continuousChannels->getLast()->setUnits ("a.u.");
+            continuousChannels->getLast()->inputRange = {-32768.0f, 32767.0f};
         }
     }
 

@@ -23,7 +23,13 @@ public:
     // SAME bitVolts is declared on the channel. See processDataPacket() and
     // the storage note in README.md.
     const float DEFAULT_DATA_SCALE = 0.195f;       // ELECTRODE bitVolts (Intan amplifier LSB, µV/bit)
-    const float DEFAULT_AUX_DATA_SCALE = 0.0000374f; // AUX bitVolts (Intan aux-ADC LSB)
+    // AUX channels: bitVolts = 1.0 -> values published as the raw signed
+    // ADC count (raw - 32768). Units are "a.u." so the LFP viewer doesn't try
+    // to interpret the numeric range as a physical unit. Full range is the
+    // signed-16-bit window centred on 0; smaller ranges in the range selector
+    // zoom into the typical accelerometer / supply-rail signal. Reader-side
+    // conversion: 1 LSB = 2.45V / 65536 = 37.4 µV at the RHD aux input.
+    const float DEFAULT_AUX_DATA_SCALE = 1.0f;
     
     /** Parameter limits */
     const int MIN_PORT = 1024;
