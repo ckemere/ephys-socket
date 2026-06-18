@@ -302,15 +302,27 @@ public:
         // Send command
         if (send(tcpSocket_, reinterpret_cast<char*>(cmd), CMD_PACKET_SIZE, 0) != CMD_PACKET_SIZE) {
             reportError("Failed to send TCP command");
+            markDisconnected();
             return false;
         }
-        
-        // Receive response
+
+        // Receive response. SO_RCVTIMEO on the socket means recv() returns
+        // <0 with errno EAGAIN / EWOULDBLOCK if the board doesn't respond
+        // within the timeout; recv() returns 0 if the connection was closed.
+        // In either case we mark the link dead so subsequent commands fail
+        // fast and the host can disconnect / reconnect cleanly.
         uint8_t response[5];
         int received = recv(tcpSocket_, reinterpret_cast<char*>(response), 5, 0);
-        
+
         if (received < 3) {
-            reportError("Failed to receive command response");
+            if (received < 0) {
+                reportError("TCP command timed out (no response from board)");
+            } else if (received == 0) {
+                reportError("TCP connection closed by board");
+            } else {
+                reportError("Failed to receive command response");
+            }
+            markDisconnected();
             return false;
         }
         
@@ -339,6 +351,10 @@ public:
                     *responseLen = dataLen;
                     return true;
                 }
+                // Short read or recv error: connection is in a bad state.
+                reportError("TCP data response truncated or timed out");
+                markDisconnected();
+                return false;
             } else if (dataLen > 0) {
                 // Firmware is sending more bytes than the caller's buffer can
                 // hold (newer firmware revision). Drain them so the next command's
@@ -820,7 +836,24 @@ public:
             tcpSocket_ = INVALID_SOCKET;
             return false;
         }
-        
+
+        // Bound how long a single command can wait for a response. Without
+        // this, recv() blocks indefinitely if the board's TCP stack stalls
+        // (we've observed this when the board boot races plugin-side
+        // CMD_GET_STATUS during a fresh connect). Normal responses are sub-
+        // millisecond; 3 seconds gives plenty of headroom for any legitimate
+        // command and means a stalled connection is detected promptly.
+        struct timeval tv;
+        tv.tv_sec  = 3;
+        tv.tv_usec = 0;
+        setsockopt(tcpSocket_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<char*>(&tv), sizeof(tv));
+
+        // OS-level dead-connection detection (independent of the recv timeout).
+        int keep = 1;
+        setsockopt(tcpSocket_, SOL_SOCKET, SO_KEEPALIVE,
+                   reinterpret_cast<char*>(&keep), sizeof(keep));
+
         connected_ = true;
         return true;
     }
@@ -1015,6 +1048,18 @@ public:
         std::lock_guard<std::mutex> lock(callbackMutex_);
         if (errorCallback_) {
             errorCallback_(message);
+        }
+    }
+
+    // Mark the link dead. Subsequent sendCommand calls fail fast because
+    // tcpSocket_ is INVALID_SOCKET and isReady()/foundInputSource() return
+    // false, so the host can disconnect / reconnect cleanly rather than
+    // hanging on every subsequent recv().
+    void markDisconnected() {
+        connected_ = false;
+        if (tcpSocket_ != INVALID_SOCKET) {
+            closesocket(tcpSocket_);
+            tcpSocket_ = INVALID_SOCKET;
         }
     }
     

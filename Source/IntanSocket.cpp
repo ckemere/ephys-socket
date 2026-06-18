@@ -171,48 +171,74 @@ bool IntanSocket::connectDevice(bool printOutput)
         // dark because no real RESCAN has happened, so the user is prompted to
         // RESCAN in the obvious way.
         IntanInterface::DeviceStatus status;
-        if (intanInterface->getStatus(status))
+        if (!intanInterface->getStatus(status))
         {
-            if (status.channelEnable == 0)
-            {
-                intanInterface->setChannelEnable(0x0F);
-                Thread::sleep(10);
-                intanInterface->getStatus(status);  // re-read so we log what we set
-            }
-
-            channel_enable_mask = status.channelEnable;
-            num_channels = calculateNumChannels(channel_enable_mask);
-            debugMode = (status.debugMode != 0);
-
-            // Aux sequencer state (already persisted across reconnect)
-            auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
-
-            // Fast-settle / TTL state: prefer the new aux_ctrl readback
-            // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
-            // pin select. On older firmware, fall back to the live fs_active
-            // bit (SW state isn't directly observable) and assume no TTL pin.
-            if (status.hasAuxCtrl)
-            {
-                fastSettleSw  = status.fsSwLevel;
-                fastSettleTTL = status.fsGpioEn ? (int)status.fsGpioPin : -1;
-            }
-            else
-            {
-                fastSettleSw  = status.hasAuxStatus && status.fastSettleActive;
-                fastSettleTTL = -1;
-            }
-
+            // The board responded to the constructor's getStatus but not this
+            // one -- likely a half-up TCP stack right after boot. With the
+            // recv timeout in place we don't hang, but we DO need to refuse
+            // the connection cleanly so the user can retry.
             if (printOutput)
             {
-                LOGC("Connected to Intan device - mask 0x",
-                     String::toHexString((int)channel_enable_mask),
-                     " (", num_channels, " channels), debug=",
-                     debugMode ? "ON" : "OFF");
-                LOGC("Firmware: ", status.getFirmwareVersionString().c_str());
-                CoreServices::sendStatusMessage("Intan: Connected successfully.");
+                LOGE("Intan: status read failed -- board may be still booting. "
+                     "Wait until the ethernet activity LED is steady and try "
+                     "CONNECT again.");
+                CoreServices::sendStatusMessage("Intan: not ready, retry CONNECT");
+            }
+            intanInterface.reset();
+            return false;
+        }
+
+        if (status.channelEnable == 0)
+        {
+            if (!intanInterface->setChannelEnable(0x0F))
+            {
+                if (printOutput)
+                    LOGE("Intan: setChannelEnable failed during initial seed");
+                intanInterface.reset();
+                return false;
+            }
+            Thread::sleep(10);
+            if (!intanInterface->getStatus(status))
+            {
+                if (printOutput)
+                    LOGE("Intan: status re-read failed after channel-enable seed");
+                intanInterface.reset();
+                return false;
             }
         }
-        
+
+        channel_enable_mask = status.channelEnable;
+        num_channels = calculateNumChannels(channel_enable_mask);
+        debugMode = (status.debugMode != 0);
+
+        // Aux sequencer state (already persisted across reconnect)
+        auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
+
+        // Fast-settle / TTL state: prefer the new aux_ctrl readback
+        // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
+        // pin select. On older firmware, fall back to the live fs_active
+        // bit (SW state isn't directly observable) and assume no TTL pin.
+        if (status.hasAuxCtrl)
+        {
+            fastSettleSw  = status.fsSwLevel;
+            fastSettleTTL = status.fsGpioEn ? (int)status.fsGpioPin : -1;
+        }
+        else
+        {
+            fastSettleSw  = status.hasAuxStatus && status.fastSettleActive;
+            fastSettleTTL = -1;
+        }
+
+        if (printOutput)
+        {
+            LOGC("Connected to Intan device - mask 0x",
+                 String::toHexString((int)channel_enable_mask),
+                 " (", num_channels, " channels), debug=",
+                 debugMode ? "ON" : "OFF");
+            LOGC("Firmware: ", status.getFirmwareVersionString().c_str());
+            CoreServices::sendStatusMessage("Intan: Connected successfully.");
+        }
+
         getParameter("device_ip")->setEnabled(false);
 
         if (sn->getEditor() != nullptr)
