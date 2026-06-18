@@ -12,9 +12,9 @@ samples are scaled and recorded.
 | RESCAN | idle | chip auto-detection (phase sweep, chip ID, channel mask) |
 | DBG 1P / DBG 2P | idle | device-generated sine on port A only (134 ch) or both ports (268 ch) |
 | **STATUS** | **any time** | print the full device status to the GUI console, including the aux-sequencer block (enabled/fast-settle/digout/DSP flags, active banks, per-slot indices, last injected-command result) |
-| **SETTLE** | **any time** | toggle amplifier fast settle (RHD Reg-0 D5). The PL injects `WRITE(0,0xFE)` / `WRITE(0,0xDE)` into the slot-0 aux position on the transition packet. Datasheet pulse guidance is ~2.5/f_H (≈250 µs at 7.5 kHz upper cutoff) — toggle off promptly |
+| **SETTLE** | **any time** | toggle amplifier fast settle (RHD Reg-0 D5) **and** DSP reset (CONVERT bit-H force). The PL injects `WRITE(0,0xFE)` / `WRITE(0,0xDE)` into the slot-0 aux position on the transition packet and forces bit-H on every channel CONVERT while the level is high. Datasheet pulse guidance is ~2.5/f_H (≈250 µs at 7.5 kHz upper cutoff) — toggle off promptly |
 | **AUX SEQ** | **any time** | switch the 3 aux COPI positions to the banked sequencer programs (see below). Toggling while acquiring uploads the **standby** banks and swaps them atomically at a packet boundary — exercising the live double-buffer path |
-| TTL Settle | any time | fast settle follows the selected `digital_in` pin (TTL1–8 → pins 0–7); "-" disables. Combined (OR) with the SETTLE button's software level |
+| TTL Settle | any time | both amplifier fast settle and DSP reset follow the selected `digital_in` pin (TTL1–8 → pins 0–7); "-" disables. Combined (OR) with the SETTLE button's software level. Combo is enabled only while connected and resets to "-" on disconnect, so reconnecting into a fresh-booted board never silently re-enables a TTL trigger |
 
 STATUS, SETTLE, AUX SEQ, and TTL Settle are deliberately usable **during
 acquisition** — they exist to validate the firmware's runtime-control paths.

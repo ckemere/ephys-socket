@@ -43,10 +43,11 @@ MicroZed repo when changing the protocol.
    aux inputs as `A_AUX0_1…` / `B_AUX0_1…` (per port × CIPO line). Click
    **STATUS** at any time to dump full device state to the console (View →
    **Console**, or Shift+C in a Release build).
-7. To exercise the run-time features: **SETTLE** toggles amplifier fast settle;
-   the **TTL Settle** dropdown makes fast settle follow a digital-input pin;
-   **AUX SEQ** switches the aux slots to the banked accelerometer/housekeeping
-   programs (and, toggled while streaming, performs a live bank swap).
+7. To exercise the run-time features: **SETTLE** toggles amplifier fast
+   settle and DSP reset together; the **TTL Settle** dropdown makes both
+   follow a digital-input pin; **AUX SEQ** switches the aux slots to the
+   banked accelerometer/housekeeping programs (and, toggled while streaming,
+   performs a live bank swap).
 
 A connected **headstage accelerometer** (auxin1/2/3) shows up on the AUX
 channels — select the **AUX** channel type in the LFP viewer's range selector
