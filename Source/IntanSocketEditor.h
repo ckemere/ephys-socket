@@ -51,22 +51,27 @@ private:
     std::unique_ptr<Label> rateLabel;
 };
 
-/** UI component for chip detection display */
-class ChipInterface : public Component
+/** UI component showing both CIPO chip slots for one port (A or B). */
+class PortInterface : public Component
 {
 public:
-    ChipInterface(IntanSocket* node, int cipoIndex);
-    ~ChipInterface() {}
-    
+    PortInterface(IntanSocket* node, const String& portName);
+    ~PortInterface() {}
+
     void paint(Graphics& g) override;
-    void updateChipStatus(bool detected, IntanInterface::ChipType chipType);
-    
+    void updateCipo0Status(bool detected, IntanInterface::ChipType chipType);
+    void updateCipo1Status(bool detected, IntanInterface::ChipType chipType);
+    void reset();
+
 private:
     IntanSocket* node;
-    int cipoIndex;
-    bool isDetected;
-    IntanInterface::ChipType chipType;
-    String label;
+    String portName;
+    bool cipo0Detected = false;
+    bool cipo1Detected = false;
+    IntanInterface::ChipType cipo0Type = IntanInterface::ChipType::NONE;
+    IntanInterface::ChipType cipo1Type = IntanInterface::ChipType::NONE;
+
+    void paintChipBox(Graphics& g, int x, bool detected, IntanInterface::ChipType type);
 };
 
 class IntanSocketEditor : public GenericEditor,
@@ -98,13 +103,21 @@ public:
     /** Update chip detection display */
     void updateChipDetection(const IntanInterface::AutoDetectionResult& result);
 
+    /** Sync editor state from the device's status response. Called on connect
+        so the UI snaps to whatever the firmware is already configured for
+        (channel-enable mask + debug mode), without forcing a RESCAN. */
+    void syncFromDeviceState(uint8_t channelMask, bool debugOn);
+
 private:
     // Buttons
     std::unique_ptr<UtilityButton> connectButton;
     std::unique_ptr<UtilityButton> disconnectButton;
     std::unique_ptr<UtilityButton> rescanButton;
-    std::unique_ptr<UtilityButton> debugModeButton;
-    bool debugModeActive;  // Track debug mode state
+    std::unique_ptr<UtilityButton> debugMode1PButton;   // single-port (0x0F)
+    std::unique_ptr<UtilityButton> debugMode2PButton;   // dual-port (0xFF)
+    enum class DebugMode { Off, SinglePort, DualPort };
+    DebugMode debugModeState = DebugMode::Off;
+    void refreshDebugButtons();
 
     // Aux sequencer test tooling (all usable DURING acquisition)
     std::unique_ptr<UtilityButton> statusButton;      // print device status to console
@@ -117,8 +130,8 @@ private:
     void refreshAuxButtons();
     
     // UI components
-    std::unique_ptr<ChipInterface> cipo0Interface;
-    std::unique_ptr<ChipInterface> cipo1Interface;
+    std::unique_ptr<PortInterface> portAInterface;
+    std::unique_ptr<PortInterface> portBInterface;
     std::unique_ptr<SampleRateInterface> sampleRateInterface;
     std::unique_ptr<BandwidthInterface> bandwidthInterface;
     

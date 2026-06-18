@@ -137,23 +137,13 @@ bool IntanSocket::connectDevice(bool printOutput)
             return false;
         }
 
-        // CRITICAL: Configure channel enable BEFORE getting status
-        // Firmware defaults to 0x0, we want all 4 channels
-        if (!intanInterface->setChannelEnable(0x0F)) {
-            LOGE("Failed to set channel enable");
-            intanInterface.reset();
-            return false;
-        }
-        
-        Thread::sleep(100);  // Let it take effect
-        
         // Set up data callback
         intanInterface->setDataCallback(
             [this](const uint32_t* data, size_t words, uint64_t timestamp) {
                 processDataPacket(data, words, timestamp);
             }
         );
-        
+
         // Set up error callback
         intanInterface->setErrorCallback(
             [this, printOutput](const std::string& error) {
@@ -164,22 +154,46 @@ bool IntanSocket::connectDevice(bool printOutput)
                 hasError = true;
             }
         );
-        
-        // Get device status to determine channel configuration
+
+        // Pull authoritative state from the device. The firmware retains the
+        // channel-enable mask, debug mode, phase delays, and aux-sequencer
+        // state across plugin disconnects (they live in PL registers, no NVM
+        // but they survive the lifetime of the firmware). Adopt whatever the
+        // device is in and let the editor mirror it. After any successful
+        // RESCAN, reconnecting restores the prior chip indicators and channel
+        // count without re-running detection.
+        //
+        // Exception: if the firmware just booted, channel_enable=0 (no streams
+        // configured yet). Publishing a 0-channel DataStream crashes downstream
+        // plugins on the next updateSignalChain (LFP Viewer dereferences a
+        // null stream in saveParameters). Seed the firmware with 0x0F so the
+        // signal chain has *something* valid -- the chip indicators still stay
+        // dark because no real RESCAN has happened, so the user is prompted to
+        // RESCAN in the obvious way.
         IntanInterface::DeviceStatus status;
         if (intanInterface->getStatus(status))
         {
+            if (status.channelEnable == 0)
+            {
+                intanInterface->setChannelEnable(0x0F);
+                Thread::sleep(10);
+                intanInterface->getStatus(status);  // re-read so we log what we set
+            }
+
             channel_enable_mask = status.channelEnable;
             num_channels = calculateNumChannels(channel_enable_mask);
+            debugMode = (status.debugMode != 0);
 
-            // Sync local aux-sequencer state with the device (it persists
-            // across plugin reconnects)
-            auxSeqMode = status.hasAuxStatus && status.auxSeqEnabled;
+            // Aux sequencer state (already persisted across reconnect)
+            auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
             fastSettleSw = status.hasAuxStatus && status.fastSettleActive;
 
             if (printOutput)
             {
-                LOGC("Connected to Intan device - ", num_channels, " channels active");
+                LOGC("Connected to Intan device - mask 0x",
+                     String::toHexString((int)channel_enable_mask),
+                     " (", num_channels, " channels), debug=",
+                     debugMode ? "ON" : "OFF");
                 LOGC("Firmware: ", status.getFirmwareVersionString().c_str());
                 CoreServices::sendStatusMessage("Intan: Connected successfully.");
             }
@@ -188,7 +202,15 @@ bool IntanSocket::connectDevice(bool printOutput)
         getParameter("device_ip")->setEnabled(false);
 
         if (sn->getEditor() != nullptr)
-            static_cast<IntanSocketEditor*>(sn->getEditor())->connected();
+        {
+            auto* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
+            editor->connected();
+            // Mirror the device's persisted state into the UI (chip indicators
+            // from channel_enable, DBG button label from debug_mode). On a fresh
+            // boot mask=0 -> no chips shown -> user clicks RESCAN. On reconnect
+            // after a previous RESCAN, the prior indicators come back for free.
+            editor->syncFromDeviceState(channel_enable_mask, debugMode);
+        }
 
         return true;
     }
@@ -238,16 +260,24 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     sourceStreams->add(stream);
     
     // ------------------------------------------------------------------
-    // Build the channel layout from the active stream mask.
+    // Build the channel layout from the active stream mask (8-bit, dual-port).
     //
-    // The PL emits, per acquisition cycle, the enabled 16-bit segments in
-    // bit order: bit0=CIPO0 regular, bit1=CIPO0 DDR, bit2=CIPO1 regular,
-    // bit3=CIPO1 DDR. Each stream carries 32 amplifier channels; only the
-    // two "regular" streams additionally carry the 3 aux inputs (the DDR
-    // stream just resamples the same aux, so its aux samples are dropped).
+    // Bits 0-3 = port A: bit0=A_CIPO0_REG, bit1=A_CIPO0_DDR,
+    //                    bit2=A_CIPO1_REG, bit3=A_CIPO1_DDR
+    // Bits 4-7 = port B: bit4=B_CIPO0_REG, bit5=B_CIPO0_DDR,
+    //                    bit6=B_CIPO1_REG, bit7=B_CIPO1_DDR
+    //
+    // The PL emits per acquisition cycle the enabled 16-bit segments in
+    // bit order (0 to 7). Each stream carries 32 amplifier channels; only
+    // the four "regular" streams additionally carry 3 aux inputs (the DDR
+    // streams just resample the same aux, so their aux samples are dropped).
     //
     // Channel order here MUST match the fill order in updateBuffer():
     //   [stream0 CH1..32][stream1 CH1..32]...  then  [aux per regular stream]
+    //
+    // For single-port 0x0F this is byte-identical to the previous layout:
+    //   A_CH1..A_CH128  then  A_AUX0_1..A_AUX0_3, A_AUX1_1..A_AUX1_3
+    // (prefix "A_" added to names, but count and order unchanged)
     // ------------------------------------------------------------------
     int n_streams = countStreams(channel_enable_mask);
     int n_aux_banks = countAuxBanks(channel_enable_mask);
@@ -262,18 +292,30 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
     sourceBuffers[0]->resize(num_channels > 0 ? num_channels : 1,
                              SAMPLE_RATE * bufferSizeInSeconds);
 
-    // Neural channels, grouped per stream (de-interleaved), sequential CH numbering
-    int neuralIdx = 0;
-    for (int b = 0; b < 4; ++b)
+    // Neural channels, grouped per stream (de-interleaved).
+    // Streams for bits 0-3 get port prefix "A_", bits 4-7 get "B_".
+    // Numbering is sequential within each port (CH1..CH32 per stream,
+    // continuing across streams of the same port).
+    int portA_neuralIdx = 0;  // running counter for port A channels
+    int portB_neuralIdx = 0;  // running counter for port B channels
+    for (int b = 0; b < 8; ++b)
     {
         if ((channel_enable_mask & (1 << b)) == 0)
             continue;
 
+        String portPrefix = (b < 4) ? "A_" : "B_";
+
         for (int k = 0; k < 32; ++k)
         {
+            int chanNum;
+            if (b < 4)
+                chanNum = ++portA_neuralIdx;
+            else
+                chanNum = ++portB_neuralIdx;
+
             ContinuousChannel::Settings chanSettings{
                 ContinuousChannel::Type::ELECTRODE,
-                "CH" + String(neuralIdx + 1),  // CH1, CH2, ... CH128
+                portPrefix + "CH" + String(chanNum),
                 "Intan neural data channel",
                 "intan.continuous.ephys",
                 data_scale,
@@ -282,25 +324,30 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
 
             continuousChannels->add(new ContinuousChannel(chanSettings));
             continuousChannels->getLast()->setUnits("uV");
-            neuralIdx++;
         }
     }
 
-    // Aux channels, only for the regular streams (CIPO0 regular = bit0,
-    // CIPO1 regular = bit2), 3 per bank, clearly identified by CIPO line.
-    for (int b = 0; b < 4; ++b)
+    // Aux channels: only for the "regular" streams, 3 per bank.
+    // Bank mapping:
+    //   bit 0 (A_CIPO0_REG) -> bank 0 -> A_AUX0_1..A_AUX0_3
+    //   bit 2 (A_CIPO1_REG) -> bank 1 -> A_AUX1_1..A_AUX1_3
+    //   bit 4 (B_CIPO0_REG) -> bank 2 -> B_AUX0_1..B_AUX0_3
+    //   bit 6 (B_CIPO1_REG) -> bank 3 -> B_AUX1_1..B_AUX1_3
+    // Bit positions of the four regular streams: 0, 2, 4, 6
+    static const int auxRegularBits[4] = {0, 2, 4, 6};
+    static const char* auxBankNames[4] = {"A_AUX0", "A_AUX1", "B_AUX0", "B_AUX1"};
+
+    for (int bankIdx = 0; bankIdx < 4; ++bankIdx)
     {
+        int b = auxRegularBits[bankIdx];
         if ((channel_enable_mask & (1 << b)) == 0)
             continue;
-        if (b != 0 && b != 2)
-            continue;  // only regular streams carry aux
 
-        int cipoNum = (b == 0) ? 0 : 1;
         for (int a = 0; a < 3; ++a)
         {
             ContinuousChannel::Settings channelSettings {
                 ContinuousChannel::AUX,
-                "AUX" + String(cipoNum) + "_" + String(a + 1),  // AUX0_1..AUX1_3
+                String(auxBankNames[bankIdx]) + "_" + String(a + 1),
                 "Intan aux input channel",
                 "intan.continuous.aux",
                 aux_data_scale,
@@ -511,9 +558,35 @@ bool IntanSocket::updateBuffer()
 
     convbuf.resize(num_channels);
 
-    int streamBits[4];
+    // Scan all 8 bits: bits 0-3 = port A, bits 4-7 = port B.
+    int streamBits[8];
     int nStreams = 0;
-    for (int b = 0; b < 4; ++b)
+    for (int b = 0; b < 8; ++b)
+    {
+        if (channel_enable_mask & (1 << b))
+            streamBits[nStreams++] = b;
+    }
+
+    // One-shot diagnostic: print the actual runtime sizes the first packet of
+    // each acquisition. If numDataWords < 140 or nStreams != 8 at 0xFF, the
+    // packet size pipeline is broken somewhere — do NOT remove until verified.
+    {
+        static uint32_t lastReportedMask = 0;
+        if (channel_enable_mask != lastReportedMask)
+        {
+            lastReportedMask = channel_enable_mask;
+            LOGC("[ephys-socket diag] mask=0x", String::toHexString((int)channel_enable_mask),
+                 " nStreams=", nStreams,
+                 " packet.data.size=", (int)packet.data.size(),
+                 " numDataWords=", (int)numDataWords,
+                 " num_channels=", num_channels);
+        }
+    }
+
+    // Re-scan (the loop above was moved up so we can report nStreams);
+    // this second pass is a no-op but kept for clarity of the original flow.
+    nStreams = 0;
+    for (int b = 0; b < 8; ++b)
         if (channel_enable_mask & (1 << b))
             streamBits[nStreams++] = b;
 
@@ -548,19 +621,23 @@ bool IntanSocket::updateBuffer()
         }
     }
 
-    // Aux channels: only the regular streams (bit 0 / bit 2). Converted
-    // exactly as the acquisition-board plugin does -- (raw - 32768) * 0.0000374
-    // -- the same (raw - midscale) * bitVolts form as the neural channels, with
-    // bitVolts = aux_data_scale = 0.0000374. The record node therefore stores
-    // (raw - 32768): the exact signed ADC count, lossless. The midscale
-    // subtraction is a constant, reversible representation choice (matching the
-    // reference plugin), not a baseline/detrend -- no acquired information is
-    // lost. Headstage accelerometer on auxin1/2/3 lands at its real operating
-    // point; the LFP viewer's AUX channel type ranges accordingly.
+    // Aux channels: only the "regular" streams carry aux inputs.
+    // Regular stream bit positions and their aux bank indices:
+    //   bit 0 (A_CIPO0_REG) -> aux bank 0
+    //   bit 2 (A_CIPO1_REG) -> aux bank 1
+    //   bit 4 (B_CIPO0_REG) -> aux bank 2
+    //   bit 6 (B_CIPO1_REG) -> aux bank 3
+    // (DDR streams at bits 1, 3, 5, 7 just resample the same aux -- drop them.)
+    //
+    // Converted exactly as the acquisition-board plugin does:
+    //   (raw - 32768) * 0.0000374
+    // The record node therefore stores (raw - 32768): the exact signed ADC
+    // count, lossless. The midscale subtraction is a constant, reversible
+    // representation choice, not a baseline/detrend.
     //
     // TWO FORMATS, distinguished PER PACKET by the aux flags in header word 4
-    // (the packet is self-describing, so this stays correct through live
-    // bank swaps and sequencer enable/disable -- firmware aux-seq-v2):
+    // (the packet is self-describing -- stays correct through live bank swaps
+    // and sequencer enable/disable -- firmware aux-seq-v2):
     //
     //  * Legacy (sequencer off, flags==0): the static table converts all
     //    three aux inputs every packet; results sit at cycles 34/0/1.
@@ -573,6 +650,8 @@ bool IntanSocket::updateBuffer()
     //    the 3 output channels stay at the full 30 kHz buffer rate.
     //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's
     //    housekeeping result -- neither is accelerometer data in this mode.)
+    //
+    // Port B uses the SAME header echo (words 4/5) as port A.
     {
         uint32_t hdr4 = packet.data.data()[4];
         uint32_t hdr5 = packet.data.data()[5];
@@ -580,14 +659,23 @@ bool IntanSocket::updateBuffer()
         bool seqActive = (auxFlags & 0x01) != 0;
         bool echoValid = (auxFlags & 0x10) != 0;
 
+        // Mapping from stream bit position to aux bank index.
+        // Regular streams are at even bit positions 0, 2, 4, 6.
+        //   bit 0 -> bank 0, bit 2 -> bank 1, bit 4 -> bank 2, bit 6 -> bank 3
+        // DDR streams (odd bits) do not carry independent aux data.
+        auto auxBankForBit = [](int b) -> int {
+            // b must be 0, 2, 4, or 6
+            return b / 2;
+        };
+
         if (!seqActive)
         {
             const int auxCycle[3] = {34, 0, 1};
             for (int s = 0; s < nStreams; ++s)
             {
                 int b = streamBits[s];
-                if (b != 0 && b != 2)
-                    continue;
+                if ((b & 1) != 0)
+                    continue;  // skip DDR streams (odd bits)
                 for (int a = 0; a < 3; ++a)
                 {
                     int flat = auxCycle[a] * nStreams + s;
@@ -604,9 +692,9 @@ bool IntanSocket::updateBuffer()
             for (int s = 0; s < nStreams; ++s)
             {
                 int b = streamBits[s];
-                if (b != 0 && b != 2)
-                    continue;
-                int bank = (b == 0) ? 0 : 1;
+                if ((b & 1) != 0)
+                    continue;  // skip DDR streams (odd bits)
+                int bank = auxBankForBit(b);
 
                 if (echoValid && isConvert && convCh >= 32 && convCh <= 34)
                     lastAccel[bank][convCh - 32] = sampleAt(0 * nStreams + s);
@@ -679,18 +767,20 @@ bool IntanSocket::applyDetectionConfig(const IntanInterface::AutoDetectionResult
     
     return true;
 }
-void IntanSocket::setDebugMode(bool enable)
+void IntanSocket::setDebugMode(bool enable, uint8_t mask)
 {
     debugMode = enable;
-    
+
     if (debugMode)
     {
         // ====================================================================
         // ENABLE DEBUG MODE
         // ====================================================================
-        
-        LOGC("Enabling debug mode - simulating 128 channels (2x64)");
-        
+
+        bool dualPort = (mask & 0xF0) != 0;
+        LOGC("Enabling debug mode - mask 0x", String::toHexString((int)mask),
+             dualPort ? " (dual-port 268ch)" : " (single-port 134ch)");
+
         // Check if we have a connection to the hardware
         if (!intanInterface || !intanInterface->isReady())
         {
@@ -699,7 +789,7 @@ void IntanSocket::setDebugMode(bool enable)
             debugMode = false;
             return;
         }
-        
+
         // Step 1: Send hardware debug mode enable command (0x12 SET_DEBUG_MODE)
         if (!intanInterface->setDebugMode(true))
         {
@@ -708,53 +798,62 @@ void IntanSocket::setDebugMode(bool enable)
             debugMode = false;
             return;
         }
-        
+
         Thread::sleep(50);  // Let hardware switch to debug mode
-        
-        // Step 2: Set channel enable to all channels (0x0F)
-        // This enables all 4 channel groups for maximum channel count
-        if (!intanInterface->setChannelEnable(0x0F))
+
+        // Step 2: Apply the requested channel-enable mask.
+        if (!intanInterface->setChannelEnable(mask))
         {
             LOGE("Failed to set channel enable for debug mode");
             CoreServices::sendStatusMessage("Intan: Failed to configure channels");
             debugMode = false;
             return;
         }
-        
+
         Thread::sleep(50);  // Let channel config take effect
-        
+
         // Step 5: Update local configuration
-        channel_enable_mask = 0x0F;
-        num_channels = calculateNumChannels(channel_enable_mask);  // 4×32 + 2×3 aux
-        
-        LOGC("Debug mode enabled successfully - hardware configured for synthetic data");
-        LOGC("Channel mask: 0x0F, Channels: ", num_channels);
-        
+        channel_enable_mask = mask;
+        num_channels = calculateNumChannels(channel_enable_mask);
+
+        LOGC("Debug mode enabled - mask 0x", String::toHexString((int)mask),
+             ", channels=", num_channels);
+
         // Step 6: Update the chip display in the editor
         if (sn->getEditor() != nullptr)
         {
             IntanSocketEditor* editor = static_cast<IntanSocketEditor*>(sn->getEditor());
-            
-            // Create a fake detection result showing 2x RHD2164 chips (64 channels each)
+
+            // Fake detection result mirroring the requested mask. Port A is
+            // lit whenever any of the low-nibble bits are on; port B only
+            // when the high nibble is on.
             IntanInterface::AutoDetectionResult debugResult;
             debugResult.success = true;
             debugResult.chipsDetected = true;
-            debugResult.cipo0Detected = true;
-            debugResult.cipo1Detected = true;
-            debugResult.cipo0ChipType = IntanInterface::ChipType::RHD2164;
-            debugResult.cipo1ChipType = IntanInterface::ChipType::RHD2164;
+            debugResult.cipo0Detected = (mask & 0x01) != 0;
+            debugResult.cipo1Detected = (mask & 0x04) != 0;
+            debugResult.cipo0ChipType = debugResult.cipo0Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
+            debugResult.cipo1ChipType = debugResult.cipo1Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
             debugResult.cipo0HasDdr = false;
             debugResult.cipo1HasDdr = false;
-            debugResult.optimalChannelMask = 0x0F;
+            debugResult.portBCipo0Detected = (mask & 0x10) != 0;
+            debugResult.portBCipo1Detected = (mask & 0x40) != 0;
+            debugResult.portBCipo0ChipType = debugResult.portBCipo0Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
+            debugResult.portBCipo1ChipType = debugResult.portBCipo1Detected ? IntanInterface::ChipType::RHD2164 : IntanInterface::ChipType::NONE;
+            debugResult.portBCipo0HasDdr = false;
+            debugResult.portBCipo1HasDdr = false;
+            debugResult.optimalChannelMask = mask;
             debugResult.bestPhase0 = 0;
             debugResult.bestPhase1 = 0;
-            
+
             editor->updateChipDetection(debugResult);
         }
-        
+
         // Step 7: Update the signal chain to reflect new channel count
         CoreServices::updateSignalChain(sn->getEditor());
-        CoreServices::sendStatusMessage("Intan: Debug mode enabled (128 channels)");
+        CoreServices::sendStatusMessage(dualPort
+            ? "Intan: Debug mode enabled (dual-port, 268 channels)"
+            : "Intan: Debug mode enabled (single-port, 134 channels)");
     }
     else
     {
@@ -838,6 +937,22 @@ void IntanSocket::printDeviceStatus()
     std::string line;
     while (std::getline(iss, line))
         LOGC(line);
+
+    // Plugin-side reception stats. These tell us whether UDP packets are being
+    // lost (timestampErrors), arriving with wrong size (sizeErrors), or with
+    // a bad magic header (magicErrors). A growing timestampErrors with a stable
+    // packetsReceived from the device == packet drops between firmware and host
+    // (network or BRAM ring overrun). Growing PL fifoCount or PS errorCount in
+    // the device status == firmware can't keep up with PL writes.
+    IntanInterface::ReceptionStats rx;
+    intanInterface->getReceptionStats(rx);
+    LOGC("--- Plugin Reception ---");
+    LOGC("Packets recv: ", (int64)rx.totalPackets,
+         "  totalErr: ", (int64)rx.totalErrors,
+         "  magicErr: ", (int64)rx.magicErrors,
+         "  tsErr: ", (int64)rx.timestampErrors,
+         "  sizeErr: ", (int64)rx.sizeErrors);
+    LOGC("Rate: ", rx.instantRate, " pkt/s (", rx.dataRateMbps, " Mbps)");
 
     CoreServices::sendStatusMessage("Intan: status printed to console");
 }
@@ -997,8 +1112,8 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
         return false;
     }
 
-    // Reset the de-interleave state to midscale until real samples arrive
-    for (int b = 0; b < 2; ++b)
+    // Reset the de-interleave state for all 4 aux banks to midscale
+    for (int b = 0; b < 4; ++b)
         for (int a = 0; a < 3; ++a)
             lastAccel[b][a] = 0x8000;
 

@@ -9,6 +9,8 @@
 #include <chrono>
 #include <vector>
 #include <queue>
+#include <cerrno>
+#include <array>
 
 // Platform-specific networking
 #ifdef _WIN32
@@ -38,8 +40,15 @@ namespace {
     constexpr uint32_t PACKET_MAGIC_HIGH = 0xCAFEBABE;
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
-    constexpr size_t STATUS_RESPONSE_SIZE = 98;        // aux-seq-v2 firmware
-    constexpr size_t STATUS_RESPONSE_SIZE_LEGACY = 86; // pre-aux firmware
+    // Firmware status response has grown twice:
+    //  86  bytes  = pre-aux firmware
+    //  98  bytes  = aux-seq-v2 firmware (adds aux sequencer block)
+    //  122 bytes  = aux-seq-v2 + DMA/perf instrumentation (current)
+    // The buffer must be sized to the largest known form, or extra bytes will
+    // sit unread in the TCP queue and corrupt the next command's ACK.
+    constexpr size_t STATUS_RESPONSE_SIZE = 122;
+    constexpr size_t STATUS_RESPONSE_SIZE_AUX = 98;
+    constexpr size_t STATUS_RESPONSE_SIZE_LEGACY = 86;
 
     // Command IDs
     enum CommandId : uint32_t {
@@ -50,6 +59,7 @@ namespace {
         CMD_SET_PHASE = 0x11,
         CMD_SET_DEBUG_MODE = 0x12,
         CMD_SET_CHANNEL_ENABLE = 0x13,
+        CMD_SET_PHASE_B = 0x14,      // port B (second cable) CIPO phase (phase2, phase3)
         CMD_LOAD_CONVERT = 0x20,
         CMD_LOAD_INIT = 0x21,
         CMD_LOAD_CABLE_TEST = 0x22,
@@ -89,6 +99,20 @@ namespace {
     constexpr size_t CABLE_TEST_PACKET_SIZE_WORDS = 74;
     constexpr double DETECTION_THRESHOLD = 60.0;
     constexpr int NUM_PHASES_TO_TEST = 16;
+
+    // Firmware (ab14c19) holds a one-packet guard band between the PL write
+    // frontier and the PS read frontier (cross-clock read-during-write fix).
+    // Worse: handle_enable_streaming() resyncs ps_read_address to the MOST
+    // RECENT magic in BRAM, so a finite loop_count that stops before that
+    // resync leaves ps_read at the last packet -- packets_available = 0 and
+    // no UDP is ever emitted. Use loop_count=0 (infinite); the PL keeps writing,
+    // PS drains continuously, and CMD_STOP halts it after we've captured.
+    // RTL: `loop_limit_reached <= (loop_count != 0) && (counter >= loop_count)`,
+    // so 0 is the "no limit" sentinel.
+    constexpr uint32_t DETECTION_LOOP_COUNT = 0;
+    // Cable test now uses ce=0xFF (both ports, all 8 streams) so port A and
+    // port B are tested in parallel; packet has 10 header + 140 data = 150 words.
+    constexpr uint8_t  DETECTION_CHANNEL_ENABLE = 0xFF;
 }
 
 // ============================================================================
@@ -172,10 +196,23 @@ public:
         running_ = true;
         udpThread_ = std::thread(&Impl::udpListenerThread, this);
         
+        // Give the listener a moment to bind so the device's reply about
+        // udp_dest reflects post-autoConfigureUdp state.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
         // Get initial status to sync channel enable
         DeviceStatus status;
         if (getStatusInternal(status)) {
             updateChannelEnable(status.channelEnable);
+            std::cout << "[IntanInterface] firmware reports udp_dest "
+                      << status.udpDestIp << ":" << status.udpDestPort
+                      << ", channel_enable=0x" << std::hex
+                      << static_cast<int>(status.channelEnable) << std::dec
+                      << ", fw " << status.getFirmwareVersionString()
+                      << std::endl;
+        } else {
+            std::cout << "[IntanInterface] WARN: initial getStatus failed"
+                      << std::endl;
         }
     }
     
@@ -282,9 +319,23 @@ public:
                     *responseLen = dataLen;
                     return true;
                 }
+            } else if (dataLen > 0) {
+                // Firmware is sending more bytes than the caller's buffer can
+                // hold (newer firmware revision). Drain them so the next command's
+                // ACK header isn't corrupted, then report failure for this call.
+                uint8_t scratch[256];
+                uint16_t remaining = dataLen;
+                while (remaining > 0) {
+                    int chunk = remaining > sizeof(scratch) ? (int)sizeof(scratch) : remaining;
+                    int got = recv(tcpSocket_, reinterpret_cast<char*>(scratch), chunk, 0);
+                    if (got <= 0) break;
+                    remaining -= (uint16_t)got;
+                }
+                *responseLen = 0;
+                return false;
             }
         }
-        
+
         return true;
     }
     
@@ -299,8 +350,10 @@ public:
             return false;
         }
 
-        // 98 bytes = aux-seq-v2 firmware; 86 = older firmware (no aux block)
-        if (dataLen != STATUS_RESPONSE_SIZE && dataLen != STATUS_RESPONSE_SIZE_LEGACY) {
+        // Accept any of the three known sizes (see STATUS_RESPONSE_SIZE comment).
+        if (dataLen != STATUS_RESPONSE_SIZE &&
+            dataLen != STATUS_RESPONSE_SIZE_AUX &&
+            dataLen != STATUS_RESPONSE_SIZE_LEGACY) {
             return false;
         }
         
@@ -348,8 +401,8 @@ public:
         p += 2; // format
         status.udpBytesSent = unpackU32LE(p); p += 4;
 
-        // Aux sequencer status block (aux-seq-v2 firmware only)
-        status.hasAuxStatus = (dataLen >= STATUS_RESPONSE_SIZE);
+        // Aux sequencer status block (aux-seq-v2 firmware and later)
+        status.hasAuxStatus = (dataLen >= STATUS_RESPONSE_SIZE_AUX);
         status.auxSeqEnabled = false;
         status.fastSettleActive = false;
         status.digoutState = false;
@@ -473,121 +526,206 @@ public:
     // ========================================================================
     // AUTO-DETECTION METHODS
     // ========================================================================
-    
+
+    // Per-CIPO-lane best across the sweep. Used by runAutoDetection and
+    // testPhaseParallel; declared once at class scope so both can share it.
+    struct LaneBest {
+        const char* label;     // "A.CIPO0", "A.CIPO1", "B.CIPO0", "B.CIPO1"
+        int      stride;       // lane stride in data-word units
+        int      offset;       // lane offset within each cycle's words
+        double   bestScore;
+        ChipType bestType;
+        bool     bestHasDdr;
+        uint8_t  bestPhase;
+        bool     detected;
+    };
+
+    // One sweep over 16 phase values, both port-A and port-B phases ganged to
+    // the same value, channel_enable = 0xFF so every packet carries CIPO0/CIPO1
+    // for BOTH cables in the same lane positions. Each phase yields a single
+    // packet; we score all four CIPO lanes from it and track per-port best.
     bool runAutoDetection(AutoDetectionResult& result, bool verbose) {
-        // Initialize result
-        result.success = false;
-        result.chipsDetected = false;
-        result.bestPhase0 = 0;
-        result.bestPhase1 = 0;
-        result.optimalChannelMask = 0;
-        result.cipo0Detected = false;
-        result.cipo1Detected = false;
-        result.cipo0HasDdr = false;
-        result.cipo1HasDdr = false;
+        result = AutoDetectionResult{};
         result.cipo0ChipType = ChipType::NONE;
         result.cipo1ChipType = ChipType::NONE;
-        result.cipo0Score = 0.0;
-        result.cipo1Score = 0.0;
-        result.allPhaseResults.clear();
-        
+        result.portBCipo0ChipType = ChipType::NONE;
+        result.portBCipo1ChipType = ChipType::NONE;
+
         if (verbose) {
-            std::cout << "[Detection] Starting automated chip detection..." << std::endl;
+            std::cout << "[Detection] Starting automated chip detection (port A + port B, parallel)..." << std::endl;
         }
-        
-        // Check device is ready (not transmitting)
+
         DeviceStatus status;
         if (!getStatusInternal(status)) {
-            if (verbose) {
-                std::cout << "[Detection] ERROR: Cannot read device status" << std::endl;
-            }
+            if (verbose) std::cout << "[Detection] ERROR: Cannot read device status" << std::endl;
             return false;
         }
-        
         if (status.transmissionActive) {
-            if (verbose) {
-                std::cout << "[Detection] ERROR: Device is transmitting. Stop acquisition first." << std::endl;
-            }
+            if (verbose) std::cout << "[Detection] ERROR: Device is transmitting. Stop acquisition first." << std::endl;
             return false;
         }
-        
-        // Initialize chips and load cable test sequence
+
+        // initializeForDetection sets channel_enable=0xFF and loop_count=DETECTION_LOOP_COUNT
         if (!initializeForDetection(verbose)) {
             return false;
         }
-        
-        // Test all phases
-        double bestScore = -1000.0;
-        
+
+        // Per-lane bookkeeping. Same struct as the method-level LaneBest below
+        // so testPhaseParallel can update bestScore/bestType in place.
+        LaneBest lanes[4] = {
+            { "A.CIPO0", 4, 0, 0.0, ChipType::NONE, false, 0, false },
+            { "A.CIPO1", 4, 1, 0.0, ChipType::NONE, false, 0, false },
+            { "B.CIPO0", 4, 2, 0.0, ChipType::NONE, false, 0, false },
+            { "B.CIPO1", 4, 3, 0.0, ChipType::NONE, false, 0, false },
+        };
+
         for (int phase = 0; phase < NUM_PHASES_TO_TEST; ++phase) {
-            if (verbose) {
-                std::cout << "[Detection] Testing phase " << phase << "..." << std::endl;
+            std::array<double, 4>   scores{0,0,0,0};
+            std::array<ChipType, 4> types{ChipType::NONE, ChipType::NONE, ChipType::NONE, ChipType::NONE};
+
+            bool ok = testPhaseParallel(static_cast<uint8_t>(phase), lanes,
+                                        scores, types, verbose);
+            if (!ok) {
+                continue;  // already logged "No packet received" in testPhaseParallel
             }
-            
-            PhaseTestResult phaseResult = testPhase(phase, verbose);
-            result.allPhaseResults.push_back(phaseResult);
-            
-            // Check if either channel is valid (score > threshold)
-            bool cipo0Valid = phaseResult.cipo0Score > DETECTION_THRESHOLD;
-            bool cipo1Valid = phaseResult.cipo1Score > DETECTION_THRESHOLD;
-            
-            if (cipo0Valid || cipo1Valid) {
-                double totalScore = phaseResult.cipo0Score + phaseResult.cipo1Score;
-                
-                if (verbose && totalScore > 0) {
-                    std::cout << "  Phase " << phase 
-                             << ": CIPO0=" << phaseResult.cipo0Score
-                             << ", CIPO1=" << phaseResult.cipo1Score << std::endl;
-                }
-                
-                if (totalScore > bestScore) {
-                    bestScore = totalScore;
-                    result.bestPhase0 = phase;
-                    result.bestPhase1 = phase;  // Use same phase for both
-                    result.cipo0Detected = cipo0Valid;
-                    result.cipo1Detected = cipo1Valid;
-                    result.cipo0HasDdr = phaseResult.cipo0HasDdr;
-                    result.cipo1HasDdr = phaseResult.cipo1HasDdr;
-                    result.cipo0ChipType = phaseResult.cipo0ChipType;
-                    result.cipo1ChipType = phaseResult.cipo1ChipType;
-                    result.cipo0Score = phaseResult.cipo0Score;
-                    result.cipo1Score = phaseResult.cipo1Score;
+
+            // Per-lane track the best phase (independent across lanes; same value
+            // of phase, but different CIPOs can prefer different phases when
+            // cables differ in length).
+            for (int i = 0; i < 4; ++i) {
+                if (scores[i] > DETECTION_THRESHOLD && scores[i] > lanes[i].bestScore) {
+                    lanes[i].bestScore   = scores[i];
+                    lanes[i].bestType    = types[i];
+                    lanes[i].bestHasDdr  = (types[i] == ChipType::RHD2164);
+                    lanes[i].bestPhase   = static_cast<uint8_t>(phase);
+                    lanes[i].detected    = true;
                 }
             }
+
+            if (verbose && (scores[0] + scores[1] + scores[2] + scores[3]) > 0) {
+                std::cout << "  Phase " << phase << ": "
+                          << "A.CIPO0=" << scores[0]
+                          << " A.CIPO1=" << scores[1]
+                          << " B.CIPO0=" << scores[2]
+                          << " B.CIPO1=" << scores[3] << std::endl;
+            }
+
+            // Record the phase result for callers that want the raw matrix.
+            PhaseTestResult pr;
+            pr.phase = static_cast<uint8_t>(phase);
+            pr.cipo0Score = scores[0]; pr.cipo1Score = scores[1];
+            pr.cipo0HasDdr = (types[0] == ChipType::RHD2164);
+            pr.cipo1HasDdr = (types[1] == ChipType::RHD2164);
+            pr.cipo0ChipType = types[0]; pr.cipo1ChipType = types[1];
+            result.allPhaseResults.push_back(pr);
         }
-        
-        // Calculate optimal channel mask
-        result.chipsDetected = result.cipo0Detected || result.cipo1Detected;
+
+        // Port A: cipo0 + cipo1
+        result.cipo0Detected     = lanes[0].detected;
+        result.cipo0ChipType     = lanes[0].bestType;
+        result.cipo0HasDdr       = lanes[0].bestHasDdr;
+        result.cipo0Score        = lanes[0].bestScore;
+        result.cipo1Detected     = lanes[1].detected;
+        result.cipo1ChipType     = lanes[1].bestType;
+        result.cipo1HasDdr       = lanes[1].bestHasDdr;
+        result.cipo1Score        = lanes[1].bestScore;
+
+        // Port B: cipo0 + cipo1
+        result.portBCipo0Detected = lanes[2].detected;
+        result.portBCipo0ChipType = lanes[2].bestType;
+        result.portBCipo0HasDdr   = lanes[2].bestHasDdr;
+        result.portBCipo1Detected = lanes[3].detected;
+        result.portBCipo1ChipType = lanes[3].bestType;
+        result.portBCipo1HasDdr   = lanes[3].bestHasDdr;
+
+        // Pick one phase per port (the better of the port's two CIPO lanes).
+        auto pickPhase = [](const LaneBest& a, const LaneBest& b) -> uint8_t {
+            if (a.detected && b.detected) {
+                return (a.bestScore >= b.bestScore) ? a.bestPhase : b.bestPhase;
+            }
+            if (a.detected) return a.bestPhase;
+            if (b.detected) return b.bestPhase;
+            return 0;
+        };
+        result.bestPhase0 = pickPhase(lanes[0], lanes[1]);
+        result.bestPhase1 = pickPhase(lanes[2], lanes[3]);
+
+        result.chipsDetected = result.cipo0Detected || result.cipo1Detected ||
+                               result.portBCipo0Detected || result.portBCipo1Detected;
         result.success = result.chipsDetected;
-        
-        if (result.success) {
-            result.optimalChannelMask = 0;
-            
-            if (result.cipo0Detected) {
-                result.optimalChannelMask |= 0x01;  // CIPO0 regular
-                if (result.cipo0HasDdr) {
-                    result.optimalChannelMask |= 0x02;  // CIPO0 DDR
-                }
-            }
-            
-            if (result.cipo1Detected) {
-                result.optimalChannelMask |= 0x04;  // CIPO1 regular
-                if (result.cipo1HasDdr) {
-                    result.optimalChannelMask |= 0x08;  // CIPO1 DDR
-                }
-            }
-            
-            if (verbose) {
-                std::cout << "[Detection] Complete! Best phase: " 
-                         << static_cast<int>(result.bestPhase0) << std::endl;
+
+        result.optimalChannelMask = 0;
+        if (result.cipo0Detected) { result.optimalChannelMask |= 0x01; if (result.cipo0HasDdr) result.optimalChannelMask |= 0x02; }
+        if (result.cipo1Detected) { result.optimalChannelMask |= 0x04; if (result.cipo1HasDdr) result.optimalChannelMask |= 0x08; }
+        if (result.portBCipo0Detected) { result.optimalChannelMask |= 0x10; if (result.portBCipo0HasDdr) result.optimalChannelMask |= 0x20; }
+        if (result.portBCipo1Detected) { result.optimalChannelMask |= 0x40; if (result.portBCipo1HasDdr) result.optimalChannelMask |= 0x80; }
+
+        if (verbose) {
+            if (result.success) {
+                std::cout << "[Detection] Complete. Port A phase=" << (int)result.bestPhase0
+                          << " port B phase=" << (int)result.bestPhase1
+                          << " mask=0x" << std::hex << (int)result.optimalChannelMask
+                          << std::dec << std::endl;
                 std::cout << "[Detection] " << result.getChannelSummary() << std::endl;
-            }
-        } else {
-            if (verbose) {
-                std::cout << "[Detection] No chips detected" << std::endl;
+            } else {
+                std::cout << "[Detection] No chips detected on either port" << std::endl;
             }
         }
-        
+        return true;
+    }
+
+    // Set both phase pairs (port A: CMD_SET_PHASE; port B: CMD_SET_PHASE_B) to
+    // `phase`, briefly run the cable-test sequence with loop_count buffered, and
+    // score all four CIPO lanes out of the captured packet.
+    bool testPhaseParallel(uint8_t phase,
+                           LaneBest (&lanes)[4],
+                           std::array<double, 4>& scoresOut,
+                           std::array<ChipType, 4>& typesOut,
+                           bool verbose) {
+        // Stop, set both ports' phases, start, capture one packet, stop.
+        sendCommand(CMD_STOP);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+        if (!sendCommand(CMD_SET_PHASE,   phase, phase) ||
+            !sendCommand(CMD_SET_PHASE_B, phase, phase)) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        RxSnapshot before = rxSnapshot();
+        startDetectionCapture();
+
+        if (!sendCommand(CMD_START)) {
+            stopDetectionCapture();
+            return false;
+        }
+
+        std::vector<uint32_t> packet;
+        bool captured = capturePacketForDetection(packet, 1.0);
+
+        sendCommand(CMD_STOP);
+        stopDetectionCapture();
+
+        if (!captured) {
+            if (verbose) {
+                RxSnapshot after = rxSnapshot();
+                std::cout << "  Phase " << static_cast<int>(phase)
+                          << ": No packet received"
+                          << "  (rx delta total=" << (after.total - before.total)
+                          << " magicErr=" << (after.magic - before.magic)
+                          << " sizeErr=" << (after.size - before.size)
+                          << ", expectedBytes=" << (expectedPacketSizeWords_ * 4)
+                          << ")" << std::endl;
+            }
+            return false;
+        }
+
+        for (int i = 0; i < 4; ++i) {
+            auto pr = scoreChannel(packet, lanes[i].stride, lanes[i].offset,
+                                   lanes[i].label, verbose);
+            scoresOut[i] = pr.first;
+            typesOut[i]  = pr.second;
+        }
         return true;
     }
     
@@ -624,15 +762,17 @@ public:
         // Get local IP that can reach device
         SOCKET tempSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (tempSock == INVALID_SOCKET) {
+            std::cout << "[IntanInterface] autoConfigureUdp: socket() failed" << std::endl;
             return;
         }
-        
+
         struct sockaddr_in serverAddr;
         std::memset(&serverAddr, 0, sizeof(serverAddr));
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(tcpPort_);
         inet_pton(AF_INET, deviceIp_.c_str(), &serverAddr.sin_addr);
-        
+
+        bool ok = false;
         if (connect(tempSock, reinterpret_cast<struct sockaddr*>(&serverAddr),
                    sizeof(serverAddr)) == 0) {
             struct sockaddr_in localAddr;
@@ -641,13 +781,21 @@ public:
                            &addrLen) == 0) {
                 char localIp[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &localAddr.sin_addr, localIp, sizeof(localIp));
-                
+
                 // Configure device to send UDP to us
                 uint32_t ipInt = stringToIp(localIp);
-                sendCommand(CMD_SET_UDP_DEST, ntohl(ipInt), udpPort_);
+                ok = sendCommand(CMD_SET_UDP_DEST, ntohl(ipInt), udpPort_);
+                std::cout << "[IntanInterface] autoConfigureUdp: telling device to send UDP to "
+                          << localIp << ":" << udpPort_
+                          << (ok ? "  (ACKed)" : "  (NACKed!)") << std::endl;
+            } else {
+                std::cout << "[IntanInterface] autoConfigureUdp: getsockname failed" << std::endl;
             }
+        } else {
+            std::cout << "[IntanInterface] autoConfigureUdp: connect() to "
+                      << deviceIp_ << ":" << tcpPort_ << " failed" << std::endl;
         }
-        
+
         closesocket(tempSock);
     }
     
@@ -655,24 +803,40 @@ public:
         // Create UDP socket
         udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpSocket_ == INVALID_SOCKET) {
+            std::cout << "[IntanInterface] UDP listener: socket() failed" << std::endl;
             reportError("Failed to create UDP socket");
             return;
         }
-        
+
+        // Allow rebinding the port even if a previous instance left it in
+        // TIME_WAIT or another local process (e.g. net.py) holds it.
+        int reuse = 1;
+        setsockopt(udpSocket_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(udpSocket_, SOL_SOCKET, SO_REUSEPORT,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#endif
+
         // Bind to UDP port
         struct sockaddr_in bindAddr;
         std::memset(&bindAddr, 0, sizeof(bindAddr));
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_addr.s_addr = INADDR_ANY;
         bindAddr.sin_port = htons(udpPort_);
-        
+
         if (bind(udpSocket_, reinterpret_cast<struct sockaddr*>(&bindAddr),
                 sizeof(bindAddr)) == SOCKET_ERROR) {
+            std::cout << "[IntanInterface] UDP listener: bind to port "
+                      << udpPort_ << " FAILED (errno=" << errno << ")" << std::endl;
             reportError("Failed to bind UDP socket");
             closesocket(udpSocket_);
             udpSocket_ = INVALID_SOCKET;
             return;
         }
+
+        std::cout << "[IntanInterface] UDP listener: bound on port "
+                  << udpPort_ << std::endl;
         
         // Set timeout for clean shutdown
         struct timeval tv;
@@ -810,23 +974,25 @@ public:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-        // Set loop count to 1 for single-packet acquisitions
-        if (!sendCommand(CMD_SET_LOOP_COUNT, 1)) {
+        // Loop count >=2 is required: firmware ab14c19 holds a one-packet guard
+        // band in packets_available(), so loop_count==1 -> zero UDP emitted.
+        if (!sendCommand(CMD_SET_LOOP_COUNT, DETECTION_LOOP_COUNT)) {
             if (verbose) {
                 std::cout << "[Detection] ERROR: Failed to set loop count" << std::endl;
             }
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        
-        // Set channel enable to all channels for cable test
-        if (!sendCommand(CMD_SET_CHANNEL_ENABLE, 0x0F)) {
+
+        // Channel enable = 0xFF: both ports' CIPO0+CIPO1 land in one packet, so
+        // a single phase sweep tests A and B in parallel.
+        if (!sendCommand(CMD_SET_CHANNEL_ENABLE, DETECTION_CHANNEL_ENABLE)) {
             if (verbose) {
                 std::cout << "[Detection] ERROR: Failed to set channel enable" << std::endl;
             }
             return false;
         }
-        updateChannelEnable(0x0F);
+        updateChannelEnable(DETECTION_CHANNEL_ENABLE);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         
         // Load and run initialization sequence
@@ -868,85 +1034,49 @@ public:
         return true;
     }
     
-    PhaseTestResult testPhase(uint8_t phase, bool verbose) {
-        PhaseTestResult result;
-        result.phase = phase;
-        result.cipo0Score = 0.0;
-        result.cipo1Score = 0.0;
-        result.cipo0HasDdr = false;
-        result.cipo1HasDdr = false;
-        result.cipo0ChipType = ChipType::NONE;
-        result.cipo1ChipType = ChipType::NONE;
-        
-        // Set phase
-        if (!sendCommand(CMD_SET_PHASE, phase, phase)) {
-            return result;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        
-        // Start capture
-        startDetectionCapture();
-        
-        // Acquire packet
-        if (!sendCommand(CMD_START)) {
-            stopDetectionCapture();
-            return result;
-        }
-        
-        // Wait and capture packet
-        std::vector<uint32_t> packet;
-        bool captured = capturePacketForDetection(packet, 2.0);
-        
-        // Stop acquisition
-        sendCommand(CMD_STOP);
-        stopDetectionCapture();
-        
-        if (!captured) {
-            if (verbose) {
-                std::cout << "  Phase " << phase << ": No packet received" << std::endl;
-            }
-            return result;
-        }
-        
-        // Score both channels
-        auto [cipo0Score, cipo0Type] = scoreChannel(packet, 0, verbose);
-        auto [cipo1Score, cipo1Type] = scoreChannel(packet, 1, verbose);
-        
-        result.cipo0Score = cipo0Score;
-        result.cipo1Score = cipo1Score;
-        result.cipo0ChipType = cipo0Type;
-        result.cipo1ChipType = cipo1Type;
-        result.cipo0HasDdr = (cipo0Type == ChipType::RHD2164);
-        result.cipo1HasDdr = (cipo1Type == ChipType::RHD2164);
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        
-        return result;
+    // Snapshot reception counters for diagnostic comparisons.
+    struct RxSnapshot {
+        uint64_t total;
+        uint64_t magic;
+        uint64_t size;
+    };
+    RxSnapshot rxSnapshot() const {
+        std::lock_guard<std::mutex> lock(statsMutex_);
+        return RxSnapshot{ totalPackets_, magicErrors_, sizeErrors_ };
     }
-    
+
+    // Score one CIPO lane out of a cable-test packet.
+    //   stride / offset = pick lane out of the packed data: one 32-bit word per
+    //                     enabled stream-pair, per cycle, in bit order.
+    //                     ce=0x0F (port A only):  stride=2  offset=0(A0) 1(A1)
+    //                     ce=0xF0 (port B only):  stride=2  offset=0(B0) 1(B1)
+    //                     ce=0xFF (both ports):   stride=4
+    //                                              offset=0(A0) 1(A1) 2(B0) 3(B1)
+    //   label is used only for verbose output (e.g. "A.CIPO0").
     std::pair<double, ChipType> scoreChannel(
-        const std::vector<uint32_t>& packet, int channel, bool verbose) {
-        
-        if (packet.size() < CABLE_TEST_PACKET_SIZE_WORDS) {
+        const std::vector<uint32_t>& packet, int stride, int offset,
+        const std::string& label, bool verbose) {
+
+        if (packet.size() < PACKET_HEADER_WORDS + 9 * static_cast<size_t>(stride)) {
             return {0.0, ChipType::NONE};
         }
-        
+
         double score = 0.0;
         ChipType chipType = ChipType::NONE;
-        
+
         // Extract data words (skip header)
         std::vector<uint32_t> dataWords(packet.begin() + PACKET_HEADER_WORDS, packet.end());
-        
+
         if (dataWords.size() < 35) {
             return {0.0, ChipType::NONE};
         }
-        
-        // Extract this channel's words (every other word starting at channel offset)
+
+        // Extract this lane's words from the tightly-packed data block.
         std::vector<uint32_t> channelWords;
-        for (size_t i = channel; i < dataWords.size() && i < 70; i += 2) {
+        for (size_t i = offset; i < dataWords.size(); i += stride) {
             channelWords.push_back(dataWords[i]);
         }
-        
+
         if (channelWords.size() < 9) {
             return {0.0, ChipType::NONE};
         }
@@ -1020,7 +1150,7 @@ public:
             std::string chipStr = (chipType == ChipType::RHD2164) ? "RHD2164" : 
                                  (chipType == ChipType::RHD2132) ? "RHD2132" : "Unknown";
             
-            std::cout << "    CIPO" << channel << ": '" << patternStr 
+            std::cout << "    " << label << ": '" << patternStr
                      << "' (" << chipStr << ")" << std::endl;
         }
         
@@ -1151,6 +1281,10 @@ bool IntanInterface::setPhaseSelect(uint8_t phase0, uint8_t phase1) {
     return pImpl_->sendCommand(CMD_SET_PHASE, phase0, phase1);
 }
 
+bool IntanInterface::setPhaseSelectB(uint8_t phase2, uint8_t phase3) {
+    return pImpl_->sendCommand(CMD_SET_PHASE_B, phase2, phase3);
+}
+
 bool IntanInterface::setDebugMode(bool enable) {
     return pImpl_->sendCommand(CMD_SET_DEBUG_MODE, enable ? 1 : 0);
 }
@@ -1227,28 +1361,35 @@ bool IntanInterface::applyDetectionConfig(const AutoDetectionResult& result) {
     if (!result.success) {
         return false;
     }
-    
-    // Set phase delays
-    if (!setPhaseSelect(result.bestPhase0, result.bestPhase1)) {
+
+    // Port A phase: bestPhase0 applies to both port-A CIPO lines (cipo0/cipo1).
+    if (!setPhaseSelect(result.bestPhase0, result.bestPhase0)) {
         return false;
     }
-    
-    // Set channel enable mask
+
+    // Port B phase: bestPhase1 applies to both port-B CIPO lines (phase2/phase3).
+    // setPhaseSelectB is a no-op on firmware without dual-port support; harmless
+    // if no chips were found there.
+    if (!setPhaseSelectB(result.bestPhase1, result.bestPhase1)) {
+        return false;
+    }
+
+    // Combined 8-bit channel enable mask (port A in [3:0], port B in [7:4]).
     if (!setChannelEnable(result.optimalChannelMask)) {
         return false;
     }
-    
+
     // Load normal conversion sequence (not cable test)
     if (!loadConvertSequence()) {
         return false;
     }
-    
+
     return true;
 }
 
 uint32_t IntanInterface::calculatePacketSize(uint8_t channelMask) {
     int numChannels = 0;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 8; ++i) {
         if (channelMask & (1 << i)) {
             numChannels++;
         }
@@ -1380,36 +1521,38 @@ std::string IntanInterface::AutoDetectionResult::getSummary() const {
     if (!success) {
         return "Detection failed. Check connections and try manual configuration.";
     }
-    
+
     if (!chipsDetected) {
         return "No Intan chips detected. Verify:\n"
                "  - SPI cable connections\n"
                "  - Chip power supply\n"
                "  - Cable integrity";
     }
-    
+
     std::ostringstream oss;
     oss << "Chips detected!\n";
-    oss << "  Best Phase: " << static_cast<int>(bestPhase0);
-    if (bestPhase0 != bestPhase1) {
-        oss << " (Phase0), " << static_cast<int>(bestPhase1) << " (Phase1)";
-    }
-    oss << "\n";
-    oss << "  Channel Mask: 0x" << std::hex << std::uppercase 
+    oss << "  Port A phase: " << static_cast<int>(bestPhase0) << "\n";
+    oss << "  Port B phase: " << static_cast<int>(bestPhase1) << "\n";
+    oss << "  Channel Mask: 0x" << std::hex << std::uppercase
         << static_cast<int>(optimalChannelMask) << std::dec << "\n";
-    
+
     if (cipo0Detected) {
-        oss << "  CIPO0: " << chipTypeToString(cipo0ChipType) << "\n";
+        oss << "  A.CIPO0: " << chipTypeToString(cipo0ChipType) << "\n";
     }
-    
     if (cipo1Detected) {
-        oss << "  CIPO1: " << chipTypeToString(cipo1ChipType) << "\n";
+        oss << "  A.CIPO1: " << chipTypeToString(cipo1ChipType) << "\n";
     }
-    
+    if (portBCipo0Detected) {
+        oss << "  B.CIPO0: " << chipTypeToString(portBCipo0ChipType) << "\n";
+    }
+    if (portBCipo1Detected) {
+        oss << "  B.CIPO1: " << chipTypeToString(portBCipo1ChipType) << "\n";
+    }
+
     double bestScore = cipo0Score + cipo1Score;
     std::string confidence = (bestScore > 100) ? "High" : "Medium";
     oss << "  Detection Confidence: " << confidence;
-    
+
     return oss.str();
 }
 
@@ -1417,22 +1560,25 @@ std::string IntanInterface::AutoDetectionResult::getChannelSummary() const {
     if (!chipsDetected) {
         return "No chips detected";
     }
-    
+
     std::vector<std::string> channels;
     if (cipo0Detected) {
-        std::string desc = "CIPO0 (" + chipTypeToString(cipo0ChipType) + ")";
-        channels.push_back(desc);
+        channels.push_back("A.CIPO0 (" + chipTypeToString(cipo0ChipType) + ")");
     }
-    
     if (cipo1Detected) {
-        std::string desc = "CIPO1 (" + chipTypeToString(cipo1ChipType) + ")";
-        channels.push_back(desc);
+        channels.push_back("A.CIPO1 (" + chipTypeToString(cipo1ChipType) + ")");
     }
-    
+    if (portBCipo0Detected) {
+        channels.push_back("B.CIPO0 (" + chipTypeToString(portBCipo0ChipType) + ")");
+    }
+    if (portBCipo1Detected) {
+        channels.push_back("B.CIPO1 (" + chipTypeToString(portBCipo1ChipType) + ")");
+    }
+
     if (channels.empty()) {
         return "No active channels";
     }
-    
+
     std::ostringstream oss;
     oss << "Active channels: ";
     for (size_t i = 0; i < channels.size(); ++i) {

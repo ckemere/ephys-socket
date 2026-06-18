@@ -174,12 +174,20 @@ public:
         bool cipo0HasDdr;
         double cipo0Score;
         
-        // CIPO1 detection
+        // CIPO1 detection (port A)
         bool cipo1Detected;
         ChipType cipo1ChipType;
         bool cipo1HasDdr;
         double cipo1Score;
-        
+
+        // Port B detection (populated by Phase 2 per-port RESCAN; false/NONE until then)
+        bool portBCipo0Detected = false;
+        ChipType portBCipo0ChipType = ChipType::NONE;
+        bool portBCipo0HasDdr = false;
+        bool portBCipo1Detected = false;
+        ChipType portBCipo1ChipType = ChipType::NONE;
+        bool portBCipo1HasDdr = false;
+
         // All phase test results
         std::vector<PhaseTestResult> allPhaseResults;
         
@@ -366,7 +374,19 @@ public:
      * @return true if command succeeded
      */
     bool setPhaseSelect(uint8_t phase0, uint8_t phase1);
-    
+
+    /**
+     * @brief Set CIPO phase delay compensation for port B (second cable)
+     *
+     * Port B has independent phase delays. On firmware without dual-port
+     * support, this returns false and has no effect.
+     *
+     * @param phase2 Phase delay for port B CIPO0 (0-15)
+     * @param phase3 Phase delay for port B CIPO1 (0-15)
+     * @return true if command succeeded
+     */
+    bool setPhaseSelectB(uint8_t phase2, uint8_t phase3);
+
     /**
      * @brief Enable or disable debug mode
      * 
