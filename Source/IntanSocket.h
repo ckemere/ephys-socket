@@ -47,6 +47,16 @@ public:
     uint8_t channel_enable_mask;
     int num_channels;
 
+    // LFP/DSP engine state, mirrored from the device at connect-time. The
+    // second DataStream / sourceBuffer is built from these values; if
+    // lfp_enabled is false at connect, no second stream is published (the
+    // user enables it from net.py / external tool and reconnects).
+    bool    lfp_enabled = false;
+    uint8_t lfp_lane_mask = 0;
+    uint8_t lfp_decim_R = 0;
+    uint8_t lfp_num_taps = 0;
+    int     lfp_num_channels = 0;   // popcount(lfp_lane_mask) * 32
+
     /** Constructor */
     IntanSocket(SourceNode* sn);
 
@@ -145,7 +155,12 @@ private:
 
     /** Converts Intan data packet to Open Ephys format */
     void processDataPacket(const uint32_t* data, size_t wordCount, uint64_t timestamp);
-    
+
+    /** Pushes one LFP frame (from the IntanInterface LFP listener) into
+        sourceBuffers[1]. Each frame is one decimated sample per channel
+        across `popcount(lane_mask) * 32` LFP channels. */
+    void processLfpFrame(const IntanInterface::LfpFrame& frame);
+
     /** Number of enabled 16-bit data streams in the 8-bit mask.
         Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
         bits 4-7 = port B (B_CIPO0_REG, B_CIPO0_DDR, B_CIPO1_REG, B_CIPO1_DDR). */
@@ -186,6 +201,7 @@ private:
     
     /** Buffers for conversion */
     std::vector<float> convbuf;
+    std::vector<float> lfpConvBuf;
     
     /** Sample counter */
     int64 totalSamples;
