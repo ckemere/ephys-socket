@@ -1828,6 +1828,23 @@ std::string IntanInterface::DeviceStatus::getSummary() const {
         oss << "Last inject result: 0x" << std::hex << std::setw(8)
             << std::setfill('0') << auxReadResult << std::dec << "\n";
     }
+    oss << "--- LFP Engine ---\n";
+    if (!hasLfpStatus) {
+        oss << "(not supported by this firmware -- status < 160 bytes)\n";
+    } else if (!lfpEnabled) {
+        oss << "Disabled  (configure + enable via remote/net.py configure_lfp)\n";
+    } else {
+        int popcount = 0;
+        for (int b = 0; b < 8; ++b) popcount += ((lfpLaneMask >> b) & 1);
+        int outRate = (lfpDecimR > 0) ? (30000 / lfpDecimR) : 0;
+        oss << "ENABLED  mask=0x" << std::hex << (int)lfpLaneMask << std::dec
+            << " (" << popcount << " streams / " << (popcount * 32) << " ch)"
+            << "  decim=" << (int)lfpDecimR
+            << " (" << outRate << " Hz)"
+            << "  taps=" << (int)lfpNumTaps << "\n";
+        oss << "Packets sent: " << lfpPacketsSent
+            << "  Overrun: " << (lfpOverrun ? "YES" : "no") << "\n";
+    }
     oss << "===========================";
     return oss.str();
 }

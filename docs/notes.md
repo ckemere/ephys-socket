@@ -23,10 +23,44 @@ layer only reaches the chip while the sequencer is enabled).
 
 On **CONNECT**, the editor pulls authoritative state from the device's
 `get_status` response — chip indicators, debug-mode label, aux-sequencer
-state. Reconnecting after a successful RESCAN restores the prior indicators
-and channel count without re-running detection. A fresh-boot firmware
+state, **and LFP engine state**. Reconnecting after a successful RESCAN
+(or after configuring LFP out-of-band) restores everything without
+re-running detection / re-uploading anything. A fresh-boot firmware
 (channel\_enable = 0) is seeded with `0x0F` so the signal chain isn't
 zero-channel; chip indicators stay dark to prompt the user to RESCAN.
+
+## LFP / DSP engine (second DataStream)
+
+Firmware ≥ 1.2 exposes a parallel LFP engine that low-pass filters and
+decimates the amplifier streams through a host-programmed FIR, emitting a
+**second UDP stream on port 5001** (broadband on 5000 is untouched). The
+plugin always binds port 5001 on connect; whether a second `DataStream` is
+published depends on the firmware reporting `lfp_enabled` in the status
+response.
+
+**Configuration is out-of-band**: the filter design lives outside the
+plugin. Use `remote/net.py` from the MicroZedIntanInterface repo:
+
+```python
+configure_lfp(sock, lane_mask=0x0F, decim_R=15, num_taps=128, cutoff_hz=600.0)
+lfp_enable(sock, True)
+```
+
+…then **reconnect the plugin** so it picks up the new config in
+`updateSettings`. See [docs/lfp.md](lfp.md) for the full external-tool
+recipe.
+
+When LFP is enabled, the plugin publishes:
+
+- a second `DataStream` named `IntanLFP`, sample rate
+  `30000 / lfp_decim_R` Hz
+- one `ContinuousChannel` per amplifier channel on every enabled LFP lane
+  (the same 8-bit lane mask convention as broadband), named
+  `LFP_A_CH1..`, `LFP_B_CH1..`, with the same `0.195 µV/LSB` scaling as
+  broadband neural
+
+The LFP frame's timestamp (`frame_seq × decim_R`) is in broadband ticks,
+so downstream nodes can correlate the two streams.
 
 ## Aux sequencer mode and accelerometer de-interleaving
 
@@ -63,7 +97,7 @@ pick the parse mode, so it stays correct through live bank swaps:
 The AUX channel count and packet size are identical in both modes, so no
 signal-chain rebuild is needed when toggling.
 
-Status response sizes grow over time. Current firmware sends **148 bytes**;
+Status response sizes grow over time. Current firmware sends **160 bytes**;
 the plugin accepts every prior size and decodes optional fields based on
 what the device actually sent:
 
@@ -74,8 +108,9 @@ what the device actually sent:
 | 122 | fw 1.1.0.0 | DMA / perf instrumentation (skipped by the plugin) |
 | 126 | `65d5fb5` | **`aux_ctrl`** — CTRL_REG_22 readback: SW level, GPIO_EN, pin select for each of fast settle / DSP reset / digout, plus Reg-3 static |
 | 148 | `7fb41dc` | **`rhd_reg[22]`** — RHD chip register shadow (commanded state of regs 0..21) |
+| 160 | `0e99881` | **LFP engine config + status** — `lfp_enabled`, `lfp_lane_mask`, `lfp_decim_R`, `lfp_num_taps`, `lfp_packets_sent`, `lfp_overrun` |
 
-The plugin sizes its buffer to the largest known form (148) so an unread
+The plugin sizes its buffer to the largest known form (160) so an unread
 suffix never sits in the TCP queue corrupting the next command's ACK. The
 `aux_ctrl` field is what lets the editor pull the TTL Settle combo from
 the device on connect instead of pushing -- a reconnect after a prior

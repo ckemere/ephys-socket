@@ -56,7 +56,10 @@ to see it at the right scale.
 ## Further reading
 
 - [docs/notes.md](docs/notes.md) — editor controls reference, aux-sequencer /
-  accelerometer parse mode, channel scaling, and how recordings are stored.
+  accelerometer parse mode, channel scaling, recordings storage, and how the
+  second LFP `DataStream` is published.
+- [docs/lfp.md](docs/lfp.md) — external recipe for configuring the LFP/DSP
+  engine (filter design + upload + enable) from `remote/net.py`.
 - [docs/building.md](docs/building.md) — Windows / Linux / macOS build
   instructions.
 
