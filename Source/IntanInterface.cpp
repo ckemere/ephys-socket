@@ -46,11 +46,13 @@ namespace {
     //  122  bytes  + DMA/perf instrumentation (fw 1.1.0.0)
     //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
     //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
+    //  160  bytes  + lfp engine config + status              -- 0e99881
     // The buffer must be sized to the largest known form, or extra bytes will
     // sit unread in the TCP queue and corrupt the next command's ACK. The
     // parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and decodes
     // optional fields based on what the device actually sent.
-    constexpr size_t STATUS_RESPONSE_SIZE = 148;
+    constexpr size_t STATUS_RESPONSE_SIZE = 160;
+    constexpr size_t STATUS_RESPONSE_SIZE_LFP = 160;
     constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
     constexpr size_t STATUS_RESPONSE_SIZE_PERF = 122;
@@ -94,7 +96,12 @@ namespace {
         CMD_READ_REGISTER = 0x73,    // p1 = reg -> 4-byte {cipo1,cipo0} response
         CMD_WRITE_REGISTER = 0x74,   // p1 = reg; p2 = value -> 4-byte echo response
         CMD_SET_FAST_SETTLE = 0x75,  // p1 = amp: sw|gpio_en<<1|pin<<4; p2 = dsp: same layout
-        CMD_SET_DIGOUT = 0x76        // p1 = sw|gpio_en<<1|pin<<4; p2 = reg3_static byte
+        CMD_SET_DIGOUT = 0x76,       // p1 = sw|gpio_en<<1|pin<<4; p2 = reg3_static byte
+        // LFP/DSP engine (firmware 0e99881 / fw >= 1.2)
+        CMD_LFP_ENABLE = 0x80,       // p1 = 0/1
+        CMD_LFP_SET_PARAMS = 0x81,   // p1 = decim_R, p2 = num_taps
+        CMD_LFP_SET_CHANNELS = 0x82, // p1 = 8-bit lane mask
+        CMD_LFP_WRITE_COEF = 0x83    // p1 bit0 = clear-ptr-first; p2 = 18-bit signed coef
     };
     
     // ACK status codes
@@ -182,6 +189,7 @@ public:
         , udpPort_(udpPort)
         , tcpSocket_(INVALID_SOCKET)
         , udpSocket_(INVALID_SOCKET)
+        , lfpSocket_(INVALID_SOCKET)
         , running_(false)
         , connected_(false)
         , currentChannelEnable_(0x0F)
@@ -212,9 +220,12 @@ public:
         // Auto-configure UDP destination
         autoConfigureUdp();
         
-        // Start UDP listener thread
+        // Start UDP listener threads (broadband on udpPort_, LFP on fixed 5001).
+        // Both bind unconditionally: the LFP listener silently consumes nothing
+        // until the firmware's LFP engine is enabled.
         running_ = true;
         udpThread_ = std::thread(&Impl::udpListenerThread, this);
+        lfpThread_ = std::thread(&Impl::lfpListenerThread, this);
         
         // Give the listener a moment to bind so the device's reply about
         // udp_dest reflects post-autoConfigureUdp state.
@@ -242,19 +253,27 @@ public:
     
     void shutdown() {
         running_ = false;
-        
+
         if (udpThread_.joinable()) {
             udpThread_.join();
         }
-        
+        if (lfpThread_.joinable()) {
+            lfpThread_.join();
+        }
+
         if (tcpSocket_ != INVALID_SOCKET) {
             closesocket(tcpSocket_);
             tcpSocket_ = INVALID_SOCKET;
         }
-        
+
         if (udpSocket_ != INVALID_SOCKET) {
             closesocket(udpSocket_);
             udpSocket_ = INVALID_SOCKET;
+        }
+
+        if (lfpSocket_ != INVALID_SOCKET) {
+            closesocket(lfpSocket_);
+            lfpSocket_ = INVALID_SOCKET;
         }
         
 #ifdef _WIN32
@@ -387,7 +406,8 @@ public:
         }
 
         // Accept any of the known sizes (see STATUS_RESPONSE_SIZE comment).
-        if (dataLen != STATUS_RESPONSE_SIZE_RHD &&
+        if (dataLen != STATUS_RESPONSE_SIZE_LFP &&
+            dataLen != STATUS_RESPONSE_SIZE_RHD &&
             dataLen != STATUS_RESPONSE_SIZE_AUXCTRL &&
             dataLen != STATUS_RESPONSE_SIZE_PERF &&
             dataLen != STATUS_RESPONSE_SIZE_AUX &&
@@ -493,13 +513,32 @@ public:
             status.reg3Static    = (auxCtrl >> AUX_CTRL_REG3_STATIC_SHIFT) & 0xFF;
         }
 
-        // RHD chip register mirror (firmware 7fb41dc+, status == 148).
+        // RHD chip register mirror (firmware 7fb41dc+, status >= 148).
         status.hasRhdRegMirror = false;
         std::memset(status.rhdReg, 0, sizeof(status.rhdReg));
         if (dataLen >= STATUS_RESPONSE_SIZE_RHD) {
             std::memcpy(status.rhdReg, p, 22);
             p += 22;
             status.hasRhdRegMirror = true;
+        }
+
+        // LFP/DSP engine config + status (firmware 0e99881+, status >= 160).
+        status.hasLfpStatus = false;
+        status.lfpEnabled = false;
+        status.lfpLaneMask = 0;
+        status.lfpDecimR = 0;
+        status.lfpNumTaps = 0;
+        status.lfpPacketsSent = 0;
+        status.lfpOverrun = false;
+        if (dataLen >= STATUS_RESPONSE_SIZE_LFP) {
+            status.hasLfpStatus = true;
+            status.lfpEnabled  = (*p++) != 0;
+            status.lfpLaneMask = *p++;
+            status.lfpDecimR   = *p++;
+            status.lfpNumTaps  = *p++;
+            status.lfpPacketsSent = unpackU32LE(p); p += 4;
+            status.lfpOverrun  = (*p++) != 0;
+            p += 3;  // reserved
         }
 
         return true;
@@ -565,11 +604,43 @@ public:
         return true;
     }
     
+    // LFP / DSP engine (firmware 0e99881+). All commands are direct passes
+    // through to the firmware -- the host owns the design (mirrors net.py's
+    // configure_lfp(); see remote/net.py).
+    bool lfpEnable(bool on) {
+        return sendCommand(CMD_LFP_ENABLE, on ? 1 : 0);
+    }
+    bool lfpSetChannels(uint8_t laneMask) {
+        return sendCommand(CMD_LFP_SET_CHANNELS, laneMask);
+    }
+    bool lfpSetParams(uint8_t decimR, uint8_t numTaps) {
+        return sendCommand(CMD_LFP_SET_PARAMS, decimR, numTaps);
+    }
+    bool lfpWriteCoef(bool clearFirst, int32_t coef18) {
+        // Param2 carries the 18-bit signed coefficient masked to its width.
+        return sendCommand(CMD_LFP_WRITE_COEF,
+                           clearFirst ? 1u : 0u,
+                           (uint32_t)(coef18) & 0x3FFFFu);
+    }
+    bool lfpUploadCoefs(const std::vector<int32_t>& coefs) {
+        bool first = true;
+        for (int32_t c : coefs) {
+            if (!lfpWriteCoef(first, c)) return false;
+            first = false;
+        }
+        return true;
+    }
+
     void setDataCallback(DataCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         dataCallback_ = callback;
     }
-    
+
+    void setLfpDataCallback(LfpDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        lfpDataCallback_ = callback;
+    }
+
     void setErrorCallback(ErrorCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         errorCallback_ = callback;
@@ -951,16 +1022,134 @@ public:
         while (running_.load()) {
             struct sockaddr_in senderAddr;
             socklen_t senderLen = sizeof(senderAddr);
-            
+
             int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.data()),
                                    buffer.size(), 0,
                                    reinterpret_cast<struct sockaddr*>(&senderAddr),
                                    &senderLen);
-            
+
             if (received > 0) {
                 processUdpData(buffer.data(), received);
             }
         }
+    }
+
+    // LFP UDP listener (fixed port 5001 per the firmware protocol). Always
+    // bound -- silently consumes nothing until the firmware's LFP engine is
+    // enabled. Frame format (24-byte header + payload):
+    //   word 0-1 : magic {0x1F1FBEEF, 0xCAFEBABE}
+    //   word 2-3 : 64-bit timestamp (= frame_seq * decim_R, aligns with broadband)
+    //   word 4   : [7:0] lane_mask | [15:8] decim_R | [23:16] num_taps | [24] overrun
+    //   word 5   : 32-bit frame sequence (drop detection)
+    //   word 6+  : popcount(lane_mask) * 32 offset-binary 16-bit samples,
+    //              packed 2 per 32-bit word; per enabled lane (low->high bit),
+    //              32 amplifier channels each.
+    static constexpr uint32_t LFP_MAGIC_LOW  = 0x1F1FBEEF;
+    static constexpr uint32_t LFP_MAGIC_HIGH = 0xCAFEBABE;
+    static constexpr uint16_t LFP_UDP_PORT_DEFAULT = 5001;
+
+    void lfpListenerThread() {
+        lfpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (lfpSocket_ == INVALID_SOCKET) {
+            std::cout << "[IntanInterface] LFP listener: socket() failed" << std::endl;
+            return;
+        }
+
+        int reuse = 1;
+        setsockopt(lfpSocket_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(lfpSocket_, SOL_SOCKET, SO_REUSEPORT,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#endif
+
+        struct sockaddr_in bindAddr;
+        std::memset(&bindAddr, 0, sizeof(bindAddr));
+        bindAddr.sin_family = AF_INET;
+        bindAddr.sin_addr.s_addr = INADDR_ANY;
+        bindAddr.sin_port = htons(LFP_UDP_PORT_DEFAULT);
+
+        if (bind(lfpSocket_, reinterpret_cast<struct sockaddr*>(&bindAddr),
+                sizeof(bindAddr)) == SOCKET_ERROR) {
+            std::cout << "[IntanInterface] LFP listener: bind to port "
+                      << LFP_UDP_PORT_DEFAULT << " FAILED (errno="
+                      << errno << ")" << std::endl;
+            closesocket(lfpSocket_);
+            lfpSocket_ = INVALID_SOCKET;
+            return;
+        }
+
+        std::cout << "[IntanInterface] LFP listener: bound on port "
+                  << LFP_UDP_PORT_DEFAULT << std::endl;
+
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(lfpSocket_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<char*>(&tv), sizeof(tv));
+
+        std::vector<uint8_t> buffer(4096);
+
+        while (running_.load()) {
+            struct sockaddr_in senderAddr;
+            socklen_t senderLen = sizeof(senderAddr);
+            int received = recvfrom(lfpSocket_, reinterpret_cast<char*>(buffer.data()),
+                                    buffer.size(), 0,
+                                    reinterpret_cast<struct sockaddr*>(&senderAddr),
+                                    &senderLen);
+            if (received > 0) {
+                processLfpDatagram(buffer.data(), received);
+            }
+        }
+    }
+
+    void processLfpDatagram(const uint8_t* data, size_t len) {
+        if (len < 24) return;  // header alone is 24 bytes
+
+        uint32_t magicLo = unpackU32LE(data);
+        uint32_t magicHi = unpackU32LE(data + 4);
+        if (magicLo != LFP_MAGIC_LOW || magicHi != LFP_MAGIC_HIGH) return;
+
+        uint64_t timestamp = (uint64_t)unpackU32LE(data + 8) |
+                             ((uint64_t)unpackU32LE(data + 12) << 32);
+        uint32_t cfg       = unpackU32LE(data + 16);
+        uint32_t frameSeq  = unpackU32LE(data + 20);
+
+        uint8_t laneMask = (uint8_t)(cfg & 0xFF);
+        uint8_t decimR   = (uint8_t)((cfg >> 8) & 0xFF);
+        uint8_t numTaps  = (uint8_t)((cfg >> 16) & 0xFF);
+        bool    overrun  = ((cfg >> 24) & 0x1) != 0;
+
+        // Payload size from the lane mask. Each enabled lane contributes 32
+        // amplifier channels x 1 16-bit sample = 64 bytes per frame.
+        int popcount = 0;
+        for (int b = 0; b < 8; ++b) popcount += ((laneMask >> b) & 1);
+        size_t expectedSamples = (size_t)popcount * 32;
+        size_t expectedBytes   = expectedSamples * sizeof(uint16_t);
+        size_t available       = len - 24;
+        if (available < expectedBytes) return;  // truncated / wrong mask
+
+        // The payload is little-endian uint16, naturally aligned. recvfrom
+        // hands us a uint8_t buffer; reinterpret as uint16_t* is safe on the
+        // platforms we target.
+        const uint16_t* samples = reinterpret_cast<const uint16_t*>(data + 24);
+
+        LfpFrame frame;
+        frame.timestamp     = timestamp;
+        frame.frameSequence = frameSeq;
+        frame.laneMask      = laneMask;
+        frame.decimR        = decimR;
+        frame.numTaps       = numTaps;
+        frame.overrun       = overrun;
+        frame.samples       = samples;
+        frame.sampleCount   = expectedSamples;
+
+        LfpDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = lfpDataCallback_;
+        }
+        if (cb) cb(frame);
     }
     
     void processUdpData(const uint8_t* data, size_t len) {
@@ -1311,9 +1500,11 @@ public:
     // Sockets
     SOCKET tcpSocket_;
     SOCKET udpSocket_;
+    SOCKET lfpSocket_;
     
     // Threading
     std::thread udpThread_;
+    std::thread lfpThread_;
     std::atomic<bool> running_;
     std::atomic<bool> connected_;
     mutable std::mutex tcpMutex_;
@@ -1337,6 +1528,7 @@ public:
     
     // Callbacks
     DataCallback dataCallback_;
+    LfpDataCallback lfpDataCallback_;
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -1457,8 +1649,32 @@ bool IntanInterface::readRegister(uint8_t reg, uint16_t& cipo0Value,
     return pImpl_->readRegister(reg, cipo0Value, cipo1Value);
 }
 
+bool IntanInterface::lfpEnable(bool on) {
+    return pImpl_->lfpEnable(on);
+}
+
+bool IntanInterface::lfpSetChannels(uint8_t laneMask) {
+    return pImpl_->lfpSetChannels(laneMask);
+}
+
+bool IntanInterface::lfpSetParams(uint8_t decimR, uint8_t numTaps) {
+    return pImpl_->lfpSetParams(decimR, numTaps);
+}
+
+bool IntanInterface::lfpWriteCoef(bool clearFirst, int32_t coef18) {
+    return pImpl_->lfpWriteCoef(clearFirst, coef18);
+}
+
+bool IntanInterface::lfpUploadCoefs(const std::vector<int32_t>& coefs) {
+    return pImpl_->lfpUploadCoefs(coefs);
+}
+
 void IntanInterface::setDataCallback(DataCallback callback) {
     pImpl_->setDataCallback(callback);
+}
+
+void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
+    pImpl_->setLfpDataCallback(callback);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {

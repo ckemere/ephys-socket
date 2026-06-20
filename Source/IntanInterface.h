@@ -125,7 +125,7 @@ public:
         uint8_t digoutGpioPin;     // digout: digital_in pin select [2:0]
         uint8_t reg3Static;        // RHD Reg-3 static (host-owned bits D7..D1)
 
-        // RHD chip register shadow (firmware 7fb41dc+, status == 148 bytes).
+        // RHD chip register shadow (firmware 7fb41dc+, status >= 148 bytes).
         // Commanded state of regs 0..21, seeded from the init sequence and
         // updated on WRITE_REGISTER. Regs 0 and 3 are owned by the PL
         // override layer -- their LIVE values are in aux_ctrl/aux_flags, the
@@ -133,6 +133,20 @@ public:
         // on older firmware; rhdReg[] is then zero.
         bool hasRhdRegMirror;
         uint8_t rhdReg[22];
+
+        // LFP/DSP engine config + status (firmware 0e99881+, status == 160).
+        // The engine emits a SEPARATE UDP stream on port 5001 (broadband on
+        // 5000 is untouched). Decimated samples = popcount(lane_mask) x 32
+        // amplifier channels per frame, at 30000/decim_R Hz. Configure with
+        // CMD_LFP_SET_CHANNELS / CMD_LFP_SET_PARAMS / CMD_LFP_WRITE_COEF,
+        // then CMD_LFP_ENABLE 1. hasLfpStatus is false on older firmware.
+        bool hasLfpStatus;
+        bool lfpEnabled;
+        uint8_t lfpLaneMask;       // which of the 8 stream bits are LFP-filtered
+        uint8_t lfpDecimR;         // decimation factor (broadband sample / output sample)
+        uint8_t lfpNumTaps;        // active FIR length
+        uint32_t lfpPacketsSent;   // LFP UDP frames emitted (firmware-side counter)
+        bool lfpOverrun;           // sticky compute-overrun flag
 
         // Helper methods
         std::string getFirmwareVersionString() const;
@@ -241,10 +255,31 @@ public:
      * @param timestamp 64-bit timestamp from device
      */
     using DataCallback = std::function<void(const uint32_t* data, size_t wordCount, uint64_t timestamp)>;
-    
+
+    /**
+     * @brief LFP frame metadata (decoded once per UDP packet on port 5001).
+     */
+    struct LfpFrame {
+        uint64_t timestamp;        // frame_seq * decim_R (aligns with broadband ts)
+        uint32_t frameSequence;    // monotonic LFP frame counter (for drop detection)
+        uint8_t  laneMask;         // streams whose 32 amp channels are in this frame
+        uint8_t  decimR;
+        uint8_t  numTaps;
+        bool     overrun;          // sticky compute-overrun flag
+        const uint16_t* samples;   // popcount(laneMask)*32 offset-binary 16-bit samples
+                                   //   layout: per enabled lane (low->high bit), 32 ch
+        size_t   sampleCount;      // == popcount(laneMask) * 32
+    };
+
+    /**
+     * @brief Callback type for receiving an LFP frame (UDP port 5001).
+     * Invoked from the LFP listener thread.
+     */
+    using LfpDataCallback = std::function<void(const LfpFrame&)>;
+
     /**
      * @brief Callback type for error notifications
-     * 
+     *
      * @param errorMessage Human-readable error description
      */
     using ErrorCallback = std::function<void(const std::string& errorMessage)>;
@@ -574,25 +609,63 @@ public:
     bool readRegister(uint8_t reg, uint16_t& cipo0Value, uint16_t& cipo1Value);
 
     // ========================================================================
+    // LFP / DSP ENGINE (firmware >= 1.2; second UDP stream on port 5001)
+    // ========================================================================
+    //
+    // The engine LP-filters and decimates the amplifier streams (the same 8
+    // bit lanes as the broadband stream), emitting a parallel UDP datagram
+    // per output frame on port 5001 -- broadband on 5000 is untouched.
+    //
+    // Configure order: lfpEnable(false) -> lfpSetChannels(mask)
+    //   -> lfpSetParams(decim_R, num_taps) -> lfpUploadCoefs(coefs)
+    //   -> lfpEnable(true).
+    // (Same sequence as remote/net.py's configure_lfp().)
+
+    /** Enable / disable the engine (also starts/stops UDP emission). */
+    bool lfpEnable(bool on);
+
+    /** Pick which of the 8 broadband lanes to LFP-filter. */
+    bool lfpSetChannels(uint8_t laneMask);
+
+    /** Set decimation factor (broadband_rate / output_rate) and FIR length. */
+    bool lfpSetParams(uint8_t decimR, uint8_t numTaps);
+
+    /** Upload one FIR tap (Q1.17 signed, 18-bit). The first call of a fresh
+     *  upload should pass `clearFirst=true` to reset the coefficient pointer. */
+    bool lfpWriteCoef(bool clearFirst, int32_t coef18);
+
+    /** Convenience: upload a full coefficient set in order (first call clears). */
+    bool lfpUploadCoefs(const std::vector<int32_t>& coefs);
+
+    // ========================================================================
     // CALLBACKS
     // ========================================================================
-    
+
     /**
      * @brief Register callback for data packets
-     * 
+     *
      * The callback is invoked from the UDP listener thread whenever
      * a valid packet is received. The callback should be fast to avoid
      * blocking packet reception.
-     * 
+     *
      * @param callback Function to call with each packet
      */
     void setDataCallback(DataCallback callback);
-    
+
+    /**
+     * @brief Register callback for LFP frames (UDP port 5001).
+     *
+     * Invoked from the LFP listener thread for every well-formed frame.
+     * The pointer / count in LfpFrame are valid only for the duration of
+     * the callback; copy what you need.
+     */
+    void setLfpDataCallback(LfpDataCallback callback);
+
     /**
      * @brief Register callback for error notifications
-     * 
+     *
      * Called when errors occur (connection loss, packet errors, etc.)
-     * 
+     *
      * @param callback Function to call with error messages
      */
     void setErrorCallback(ErrorCallback callback);
