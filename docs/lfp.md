@@ -1,21 +1,41 @@
-# LFP / DSP engine — external configure recipe
+# LFP / DSP engine — configure recipe
 
 The plugin **receives** the LFP UDP stream and publishes a second
-`DataStream`, but it does **not** design or upload filter coefficients.
-That stays in an external tool so the filter library can evolve
-independently of the OE plugin (and so a tighter loop is possible while
-tuning).
+`DataStream`. It also ships **a single set of defaults** matching
+`remote/net.py`'s `configure_lfp()` — the editor's `LFP` button applies
+them automatically on first enable. Filter **updates** (different cutoff,
+custom lane mask, different decimation) still go through the external
+tool so the filter library can evolve independently of the plugin.
+
+## Quickstart — defaults (no external tool needed)
+
+1. CONNECT the plugin to a board running firmware ≥ 1.2.
+2. Click **LFP**. If the engine has never been configured since boot,
+   the plugin applies the defaults below and enables.
+3. A second `DataStream` `IntanLFP` appears in the signal chain.
+
+Default values (same as `net.py` `configure_lfp(...)` defaults):
+
+| Param | Value | Meaning |
+|---|---|---|
+| `lane_mask` | `0x0F` | port A, all 4 streams (128 amplifier channels) |
+| `decim_R` | `15` | 30 kHz / 15 = **2 kHz** output sample rate |
+| `num_taps` | `128` | FIR length |
+| `cutoff_hz` | `600` | windowed-sinc (Hamming) LP, unity DC gain, Q1.17 |
+
+The C++ designer is a bit-identical port of `design_lfp_lowpass()` in
+net.py — same coefficient set, same quantization.
+
+## External configure — custom values
 
 The reference tool is `remote/net.py` in the MicroZedIntanInterface
-repository. It already implements:
+repository. It implements:
 
 - `design_lfp_lowpass(num_taps, cutoff_hz, fs=30000)` — windowed-sinc
   (Hamming) low-pass FIR, unity DC gain, quantized to Q1.17 (18-bit signed).
 - `configure_lfp(sock, lane_mask, decim_R, num_taps, cutoff_hz)` — disables
   the engine, sets channels + params, designs + uploads the filter.
 - `lfp_enable(sock, on)` — starts / stops UDP emission on port 5001.
-
-## Quickstart
 
 From the MicroZed repo's `remote/` directory:
 

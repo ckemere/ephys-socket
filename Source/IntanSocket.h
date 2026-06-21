@@ -140,16 +140,21 @@ public:
     bool isAuxSequencerMode() const { return auxSeqMode; }
 
     /** Enable / disable the firmware's LFP/DSP engine + the second
-        UDP stream (port 5001). Filter design and channel-mask / decimation
-        / coefficient upload are out-of-band (see docs/lfp.md);
-        this only flips the engine's run bit and refreshes the
-        local LFP state (which gates whether updateSettings publishes the
-        second DataStream). Caller is expected to invoke
+        UDP stream (port 5001). When enabling and the firmware has no
+        configuration yet (lane_mask = 0 or decim_R = 0), this first
+        applies a default configure -- same values as remote/net.py's
+        configure_lfp(): 0x0F lane mask, decim 15 (2 kHz output), 128-tap
+        Hamming-windowed sinc with 600 Hz cutoff. Filter UPDATES still go
+        through the external tool. Caller is expected to invoke
         CoreServices::updateSignalChain afterwards so the stream count
-        change actually takes effect in OE. Returns false if the firmware
-        hasn't been configured (lane mask = 0 or decim = 0) when enabling. */
+        change actually takes effect in OE. */
     bool setLfpEnabled(bool enable);
     bool isLfpEnabled() const { return lfp_enabled; }
+
+    /** Apply the net.py default LFP configuration (lane_mask=0x0F,
+        decim_R=15, num_taps=128, cutoff=600 Hz) -- DOES NOT enable.
+        Used by setLfpEnabled(true) when the firmware is fresh. */
+    bool configureLfpDefaults();
 
 private:
     const int bufferSizeInSeconds = 10;

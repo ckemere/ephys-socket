@@ -637,6 +637,23 @@ public:
     /** Convenience: upload a full coefficient set in order (first call clears). */
     bool lfpUploadCoefs(const std::vector<int32_t>& coefs);
 
+    /** Default LFP-engine parameters (mirror remote/net.py configure_lfp). */
+    struct LfpDefaults {
+        static constexpr uint8_t LANE_MASK = 0x0F;     // port A, all 4 streams
+        static constexpr uint8_t DECIM_R   = 15;       // 30000 / 15 = 2000 Hz
+        static constexpr uint8_t NUM_TAPS  = 128;
+        static constexpr double  CUTOFF_HZ = 600.0;
+        static constexpr double  FS        = 30000.0;
+        static constexpr int     COEF_FRAC = 17;       // Q1.17
+    };
+
+    /** Design a windowed-sinc (Hamming) low-pass FIR with unity DC gain,
+     *  quantized to Q1.17 signed (18-bit). Exactly mirrors net.py's
+     *  design_lfp_lowpass(); use for the default configure path. */
+    static std::vector<int32_t> lfpDesignLowpass(int numTaps,
+                                                 double cutoffHz,
+                                                 double fs = LfpDefaults::FS);
+
     // ========================================================================
     // CALLBACKS
     // ========================================================================

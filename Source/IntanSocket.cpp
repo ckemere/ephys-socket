@@ -1313,6 +1313,33 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     return true;
 }
 
+bool IntanSocket::configureLfpDefaults()
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("LFP: device not connected (configureLfpDefaults)");
+        return false;
+    }
+    using D = IntanInterface::LfpDefaults;
+
+    // Mirror remote/net.py configure_lfp() ordering: disable, set channels,
+    // set params, design + upload coefficients. Caller enables afterwards.
+    if (!intanInterface->lfpEnable(false))             return false;
+    if (!intanInterface->lfpSetChannels(D::LANE_MASK)) return false;
+    if (!intanInterface->lfpSetParams(D::DECIM_R, D::NUM_TAPS)) return false;
+
+    auto coefs = IntanInterface::lfpDesignLowpass(D::NUM_TAPS, D::CUTOFF_HZ, D::FS);
+    if ((int)coefs.size() != D::NUM_TAPS)              return false;
+    if (!intanInterface->lfpUploadCoefs(coefs))        return false;
+
+    LOGC("LFP defaults applied: lane=0x", String::toHexString((int)D::LANE_MASK),
+         " decim=", (int)D::DECIM_R,
+         " (", (int)(D::FS / D::DECIM_R), " Hz)",
+         " taps=", (int)D::NUM_TAPS,
+         " cutoff=", (int)D::CUTOFF_HZ, " Hz");
+    return true;
+}
+
 bool IntanSocket::setLfpEnabled(bool enable)
 {
     if (!intanInterface || !intanInterface->foundInputSource())
@@ -1321,10 +1348,10 @@ bool IntanSocket::setLfpEnabled(bool enable)
         return false;
     }
 
-    // When enabling, sanity-check that the firmware has been configured: a
-    // lane mask + decim_R must be set, or the engine will emit garbage / no
-    // frames. Filter design + upload + mask/params live in the external
-    // tool (remote/net.py configure_lfp); see docs/lfp.md.
+    // When enabling, make sure the firmware has been configured. If the
+    // engine has never been set up since boot (lane_mask = 0 or decim_R =
+    // 0), apply net.py-style defaults so the button "just works". Filter
+    // UPDATES still go through the external tool (docs/lfp.md).
     if (enable)
     {
         IntanInterface::DeviceStatus s;
@@ -1342,11 +1369,13 @@ bool IntanSocket::setLfpEnabled(bool enable)
         }
         if (s.lfpLaneMask == 0 || s.lfpDecimR == 0)
         {
-            LOGE("LFP: engine is not configured yet -- run net.py "
-                 "configure_lfp(...) first, then ENABLE LFP from the editor");
-            CoreServices::sendStatusMessage(
-                "Intan: LFP not configured (run configure_lfp first)");
-            return false;
+            LOGC("LFP: no firmware config yet -- applying net.py defaults");
+            if (!configureLfpDefaults())
+            {
+                LOGE("LFP: default configure failed");
+                CoreServices::sendStatusMessage("Intan: LFP configure failed");
+                return false;
+            }
         }
     }
 

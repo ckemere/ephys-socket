@@ -11,6 +11,7 @@
 #include <queue>
 #include <cerrno>
 #include <array>
+#include <cmath>
 
 // Platform-specific networking
 #ifdef _WIN32
@@ -1667,6 +1668,43 @@ bool IntanInterface::lfpWriteCoef(bool clearFirst, int32_t coef18) {
 
 bool IntanInterface::lfpUploadCoefs(const std::vector<int32_t>& coefs) {
     return pImpl_->lfpUploadCoefs(coefs);
+}
+
+// Windowed-sinc (Hamming) low-pass FIR, unity DC gain, quantized to Q1.17
+// signed. Exact port of remote/net.py design_lfp_lowpass() so the plugin
+// and net.py produce bit-identical kernels at the same params.
+std::vector<int32_t> IntanInterface::lfpDesignLowpass(int numTaps,
+                                                     double cutoffHz,
+                                                     double fs) {
+    const double fc = cutoffHz / fs;           // normalised cutoff (cycles/sample)
+    const double M  = numTaps - 1.0;
+    std::vector<double> h(numTaps);
+    for (int n = 0; n < numTaps; ++n) {
+        double x = (double)n - M / 2.0;
+        double s;
+        if (std::fabs(x) < 1e-9) {
+            s = 2.0 * fc;                       // sinc at zero
+        } else {
+            s = std::sin(2.0 * M_PI * fc * x) / (M_PI * x);
+        }
+        double w = 0.54 - 0.46 * std::cos(2.0 * M_PI * (double)n / M);  // Hamming
+        h[n] = s * w;
+    }
+    double g = 0.0;
+    for (double v : h) g += v;
+    if (g == 0.0) g = 1.0;
+
+    const int32_t scale = 1 << LfpDefaults::COEF_FRAC;   // 1<<17
+    const int32_t lim   = 1 << LfpDefaults::COEF_FRAC;   // also 1<<17 (clamp limit)
+    std::vector<int32_t> coefs(numTaps);
+    for (int n = 0; n < numTaps; ++n) {
+        double normalised = h[n] / g * (double)scale;
+        long long q = (long long)std::llround(normalised);
+        if (q >  lim - 1) q = lim - 1;
+        if (q < -lim)     q = -lim;
+        coefs[n] = (int32_t)q;
+    }
+    return coefs;
 }
 
 void IntanInterface::setDataCallback(DataCallback callback) {
