@@ -139,6 +139,18 @@ public:
     bool setAuxSequencerMode(bool enable);
     bool isAuxSequencerMode() const { return auxSeqMode; }
 
+    /** Enable / disable the firmware's LFP/DSP engine + the second
+        UDP stream (port 5001). Filter design and channel-mask / decimation
+        / coefficient upload are out-of-band (see docs/lfp.md);
+        this only flips the engine's run bit and refreshes the
+        local LFP state (which gates whether updateSettings publishes the
+        second DataStream). Caller is expected to invoke
+        CoreServices::updateSignalChain afterwards so the stream count
+        change actually takes effect in OE. Returns false if the firmware
+        hasn't been configured (lane mask = 0 or decim = 0) when enabling. */
+    bool setLfpEnabled(bool enable);
+    bool isLfpEnabled() const { return lfp_enabled; }
+
 private:
     const int bufferSizeInSeconds = 10;
     

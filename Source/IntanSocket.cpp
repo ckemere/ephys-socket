@@ -1312,3 +1312,77 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     CoreServices::sendStatusMessage("Intan: aux sequencer active");
     return true;
 }
+
+bool IntanSocket::setLfpEnabled(bool enable)
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("LFP: device not connected");
+        return false;
+    }
+
+    // When enabling, sanity-check that the firmware has been configured: a
+    // lane mask + decim_R must be set, or the engine will emit garbage / no
+    // frames. Filter design + upload + mask/params live in the external
+    // tool (remote/net.py configure_lfp); see docs/lfp.md.
+    if (enable)
+    {
+        IntanInterface::DeviceStatus s;
+        if (!intanInterface->getStatus(s))
+        {
+            LOGE("LFP: status read failed before enable");
+            return false;
+        }
+        if (!s.hasLfpStatus)
+        {
+            LOGE("LFP: firmware doesn't expose the LFP engine "
+                 "(update BOOT.bin to fw >= 1.2)");
+            CoreServices::sendStatusMessage("Intan: firmware lacks LFP engine");
+            return false;
+        }
+        if (s.lfpLaneMask == 0 || s.lfpDecimR == 0)
+        {
+            LOGE("LFP: engine is not configured yet -- run net.py "
+                 "configure_lfp(...) first, then ENABLE LFP from the editor");
+            CoreServices::sendStatusMessage(
+                "Intan: LFP not configured (run configure_lfp first)");
+            return false;
+        }
+    }
+
+    if (!intanInterface->lfpEnable(enable))
+    {
+        LOGE("LFP: ", enable ? "enable" : "disable", " command failed");
+        return false;
+    }
+
+    // Re-read status so our local LFP state (which gates the second
+    // DataStream in updateSettings) reflects the new firmware state.
+    IntanInterface::DeviceStatus s;
+    if (intanInterface->getStatus(s))
+    {
+        if (s.hasLfpStatus && s.lfpEnabled
+            && s.lfpLaneMask != 0 && s.lfpDecimR != 0)
+        {
+            lfp_enabled  = true;
+            lfp_lane_mask = s.lfpLaneMask;
+            lfp_decim_R  = s.lfpDecimR;
+            lfp_num_taps = s.lfpNumTaps;
+            int popcount = 0;
+            for (int b = 0; b < 8; ++b)
+                popcount += ((lfp_lane_mask >> b) & 1);
+            lfp_num_channels = popcount * 32;
+            LOGC("LFP enabled - ", lfp_num_channels, " channels @ ",
+                 (int)(SAMPLE_RATE / lfp_decim_R), " Hz");
+            CoreServices::sendStatusMessage("Intan: LFP stream ON");
+        }
+        else
+        {
+            lfp_enabled = false;
+            lfp_num_channels = 0;
+            LOGC("LFP disabled");
+            CoreServices::sendStatusMessage("Intan: LFP stream off");
+        }
+    }
+    return true;
+}

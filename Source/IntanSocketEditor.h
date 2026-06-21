@@ -123,8 +123,10 @@ private:
     std::unique_ptr<UtilityButton> statusButton;      // print device status to console
     std::unique_ptr<UtilityButton> fastSettleButton;  // toggle software fast settle
     std::unique_ptr<UtilityButton> auxModeButton;     // toggle banked-aux/accel mode
+    std::unique_ptr<UtilityButton> lfpEnableButton;   // toggle LFP/DSP engine + 2nd stream
     bool fastSettleActive;
     bool auxModeActive;
+    bool lfpActive;
 
     /** Refresh the tooling buttons' labels/colors from node state */
     void refreshAuxButtons();
