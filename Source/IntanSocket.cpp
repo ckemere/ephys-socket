@@ -480,11 +480,16 @@ void IntanSocket::updateSettings(OwnedArray<ContinuousChannel>* continuousChanne
         DataStream* lfpStream = new DataStream(lfpSettings);
         sourceStreams->add(lfpStream);
 
-        // Resize the LFP source buffer (sourceBuffers[1] -- created by the
-        // SourceNode when a second DataStream is added). 10 s of buffer at
-        // the LFP rate is plenty; ~20 kB for 256 ch @ 2 kHz.
-        sourceBuffers[1]->resize(lfp_num_channels,
-                                 (int)(lfpSampleRate * bufferSizeInSeconds));
+        // sourceBuffers is owned by the plugin (not auto-managed by OE) and
+        // the constructor only creates [0] for the broadband stream. Add the
+        // LFP buffer on first connect with LFP enabled; resize on subsequent
+        // reconnects when the channel count / rate might have changed.
+        int lfpBufferSamples = (int)(lfpSampleRate * bufferSizeInSeconds);
+        if (sourceBuffers.size() < 2) {
+            sourceBuffers.add(new DataBuffer(lfp_num_channels, lfpBufferSamples));
+        } else {
+            sourceBuffers[1]->resize(lfp_num_channels, lfpBufferSamples);
+        }
 
         // Channel naming mirrors the broadband layout but with an LFP_
         // prefix: LFP_A_CH1.., LFP_B_CH1.. Lane order follows the same
