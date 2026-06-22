@@ -178,6 +178,16 @@ private:
         across `popcount(lane_mask) * 32` LFP channels. */
     void processLfpFrame(const IntanInterface::LfpFrame& frame);
 
+    /** Phase-1 STFT receiver: logs the first N frames + tracks seq drops.
+        Phase 2 will hand frames to the visualizer canvas. */
+    void processStftFrame(const IntanInterface::StftFrame& frame);
+
+    // Phase-1 STFT logging state (atomics so the listener thread can update
+    // freely; main loop just reads). frame counter wraps at 2^30 per protocol.
+    std::atomic<uint64_t> stftFramesReceived{0};
+    std::atomic<uint64_t> stftSeqGaps{0};
+    std::atomic<uint32_t> stftLastSeq{0xFFFFFFFFu};
+
     /** Number of enabled 16-bit data streams in the 8-bit mask.
         Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
         bits 4-7 = port B (B_CIPO0_REG, B_CIPO0_DDR, B_CIPO1_REG, B_CIPO1_DDR). */

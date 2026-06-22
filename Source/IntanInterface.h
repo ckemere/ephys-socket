@@ -148,6 +148,20 @@ public:
         uint32_t lfpPacketsSent;   // LFP UDP frames emitted (firmware-side counter)
         bool lfpOverrun;           // sticky compute-overrun flag
 
+        // STFT/Tier-2 engine config + status (firmware fw>=1.3, status >= 184).
+        // The engine emits ONE jumbo UDP datagram per STFT frame on port 5003
+        // (independent of broadband + LFP). K lanes per frame, each with
+        // (N/2+1) complex float32 bins (Hermitian half). hasStftStatus is
+        // false on older firmware.
+        bool hasStftStatus;
+        bool stftEnabled;
+        uint8_t  stftNfftLog2;     // log2(N); N = 1 << stftNfftLog2
+        uint8_t  stftK;            // analyzed lanes (build param, matches the PL)
+        bool     stftOverflow;     // sticky pass-overflow flag
+        uint16_t stftHop;          // LFP frames between STFT passes
+        uint32_t stftFrameSeq;     // completed STFT passes (firmware counter)
+        uint32_t stftPacketsSent;  // STFT UDP packets emitted
+
         // Helper methods
         std::string getFirmwareVersionString() const;
         std::string getChannelEnableString() const;
@@ -276,6 +290,40 @@ public:
      * Invoked from the LFP listener thread.
      */
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
+
+    /**
+     * @brief STFT frame metadata (decoded once per UDP packet on port 5003).
+     *
+     * Wire layout (32-bit LE words):
+     *   0-1 magic {0x5DEC7A00, 0xCAFEBABE}
+     *   2-3 64-bit timestamp (~LFP frame index of this pass)
+     *   4   [7:0] nfft_log2 | [15:8] K | [31:24] flags (bit0 = overflow)
+     *   5   32-bit frame sequence (mod 2^30)
+     *   6   [15:0] nbins (= N/2+1) | [31:16] hop
+     *   7   reserved
+     *   8+  per lane (lane-major), nbins complex float32 (re, im)
+     */
+    struct StftFrame {
+        uint64_t timestamp;
+        uint32_t frameSequence;
+        uint8_t  nfftLog2;       // N = 1 << nfftLog2
+        uint8_t  K;              // analyzed lanes (one per "channel" in the lane-major payload)
+        uint16_t hop;            // LFP frames between passes (time-axis spacing)
+        uint16_t nbins;          // N/2 + 1 (the Hermitian half that's actually sent)
+        bool     overflow;
+        // Payload pointer + bin/lane stride. The view is valid only for the
+        // callback's lifetime; copy whatever you need. Layout (lane-major):
+        //   bins[lane L, bin b].re = samples[L * nbins * 2 + b * 2 + 0]
+        //   bins[lane L, bin b].im = samples[L * nbins * 2 + b * 2 + 1]
+        const float* samples;
+        size_t   sampleCount;    // == K * nbins * 2
+    };
+
+    /**
+     * @brief Callback type for receiving an STFT frame (UDP port 5003).
+     * Invoked from the STFT listener thread.
+     */
+    using StftDataCallback = std::function<void(const StftFrame&)>;
 
     /**
      * @brief Callback type for error notifications
@@ -655,6 +703,45 @@ public:
                                                  double fs = LfpDefaults::FS);
 
     // ========================================================================
+    // STFT / Tier-2 ENGINE (firmware >= 1.3; jumbo UDP on port 5003)
+    // ========================================================================
+    //
+    // The STFT engine takes K LFP lanes (one source channel per lane), windows
+    // each with a Q15 Hann taper, and emits a sequence of (N/2+1)-bin complex
+    // float32 spectra over UDP. Configure order: stftEnable(false) ->
+    // stftSetParams(nfft_log2, hop) -> stftUploadChannels(...) ->
+    // stftUploadWindow(...) -> stftEnable(true). The host designs the window;
+    // stftDesignHann() is the reference design used by net.py.
+
+    struct StftDefaults {
+        static constexpr uint8_t  NFFT_LOG2 = 6;     // N = 64
+        static constexpr uint16_t HOP       = 1;     // every LFP frame
+        static constexpr int      Q15_FULL  = 32767;
+    };
+
+    /** Enable / disable the engine (also starts/stops UDP emission). */
+    bool stftEnable(bool on);
+
+    /** Set FFT length (log2) and pass-to-pass hop. */
+    bool stftSetParams(uint8_t nfftLog2, uint16_t hop);
+
+    /** Push one lane's source-channel selection. `clearFirst=true` on the
+     *  first call of a fresh upload resets the lane pointer. */
+    bool stftSetChannelEntry(bool clearFirst, uint8_t sourceChannel);
+
+    /** Convenience: upload K lane selections in one go (first call clears). */
+    bool stftUploadChannels(const std::vector<uint8_t>& channels);
+
+    /** Push one window tap (Q15 signed). `clearFirst=true` resets pointer. */
+    bool stftWriteWindowTap(bool clearFirst, int16_t coefQ15);
+
+    /** Convenience: upload N window taps in one go (first call clears). */
+    bool stftUploadWindow(const std::vector<int16_t>& taps);
+
+    /** Hann window, signed Q15. Exactly mirrors net.py's design_stft_window. */
+    static std::vector<int16_t> stftDesignHann(int n);
+
+    // ========================================================================
     // CALLBACKS
     // ========================================================================
 
@@ -677,6 +764,15 @@ public:
      * the callback; copy what you need.
      */
     void setLfpDataCallback(LfpDataCallback callback);
+
+    /**
+     * @brief Register callback for STFT frames (UDP port 5003).
+     *
+     * Invoked from the STFT listener thread for every well-formed jumbo
+     * datagram. The samples pointer is valid only for the duration of the
+     * callback; copy what you need.
+     */
+    void setStftDataCallback(StftDataCallback callback);
 
     /**
      * @brief Register callback for error notifications

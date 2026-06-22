@@ -48,11 +48,13 @@ namespace {
     //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
     //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
     //  160  bytes  + lfp engine config + status              -- 0e99881
+    //  184  bytes  + stft engine (16) + playback (8)         -- fw 1.3
     // The buffer must be sized to the largest known form, or extra bytes will
     // sit unread in the TCP queue and corrupt the next command's ACK. The
     // parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and decodes
     // optional fields based on what the device actually sent.
-    constexpr size_t STATUS_RESPONSE_SIZE = 160;
+    constexpr size_t STATUS_RESPONSE_SIZE = 184;
+    constexpr size_t STATUS_RESPONSE_SIZE_STFT = 184;
     constexpr size_t STATUS_RESPONSE_SIZE_LFP = 160;
     constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
@@ -102,7 +104,12 @@ namespace {
         CMD_LFP_ENABLE = 0x80,       // p1 = 0/1
         CMD_LFP_SET_PARAMS = 0x81,   // p1 = decim_R, p2 = num_taps
         CMD_LFP_SET_CHANNELS = 0x82, // p1 = 8-bit lane mask
-        CMD_LFP_WRITE_COEF = 0x83    // p1 bit0 = clear-ptr-first; p2 = 18-bit signed coef
+        CMD_LFP_WRITE_COEF = 0x83,   // p1 bit0 = clear-ptr-first; p2 = 18-bit signed coef
+        // STFT/Tier-2 engine (fw >= 1.3; jumbo UDP on port 5003)
+        CMD_STFT_ENABLE = 0x84,        // p1 = 0/1
+        CMD_STFT_SET_PARAMS = 0x85,    // p1 = nfft_log2, p2 = hop
+        CMD_STFT_SET_CHANNELS = 0x86,  // p1 bit0 = clear-ptr-first; p2 = source channel for ONE lane
+        CMD_STFT_WRITE_WINDOW = 0x87   // p1 bit0 = clear-ptr-first; p2 = Q15 Hann tap
     };
     
     // ACK status codes
@@ -191,6 +198,7 @@ public:
         , tcpSocket_(INVALID_SOCKET)
         , udpSocket_(INVALID_SOCKET)
         , lfpSocket_(INVALID_SOCKET)
+        , stftSocket_(INVALID_SOCKET)
         , running_(false)
         , connected_(false)
         , currentChannelEnable_(0x0F)
@@ -221,12 +229,13 @@ public:
         // Auto-configure UDP destination
         autoConfigureUdp();
         
-        // Start UDP listener threads (broadband on udpPort_, LFP on fixed 5001).
-        // Both bind unconditionally: the LFP listener silently consumes nothing
-        // until the firmware's LFP engine is enabled.
+        // Start UDP listener threads (broadband on udpPort_, LFP on 5001,
+        // STFT on 5003). All three bind unconditionally: the LFP and STFT
+        // listeners silently consume nothing until their engines are enabled.
         running_ = true;
-        udpThread_ = std::thread(&Impl::udpListenerThread, this);
-        lfpThread_ = std::thread(&Impl::lfpListenerThread, this);
+        udpThread_  = std::thread(&Impl::udpListenerThread, this);
+        lfpThread_  = std::thread(&Impl::lfpListenerThread, this);
+        stftThread_ = std::thread(&Impl::stftListenerThread, this);
         
         // Give the listener a moment to bind so the device's reply about
         // udp_dest reflects post-autoConfigureUdp state.
@@ -261,6 +270,9 @@ public:
         if (lfpThread_.joinable()) {
             lfpThread_.join();
         }
+        if (stftThread_.joinable()) {
+            stftThread_.join();
+        }
 
         if (tcpSocket_ != INVALID_SOCKET) {
             closesocket(tcpSocket_);
@@ -275,6 +287,11 @@ public:
         if (lfpSocket_ != INVALID_SOCKET) {
             closesocket(lfpSocket_);
             lfpSocket_ = INVALID_SOCKET;
+        }
+
+        if (stftSocket_ != INVALID_SOCKET) {
+            closesocket(stftSocket_);
+            stftSocket_ = INVALID_SOCKET;
         }
         
 #ifdef _WIN32
@@ -407,7 +424,8 @@ public:
         }
 
         // Accept any of the known sizes (see STATUS_RESPONSE_SIZE comment).
-        if (dataLen != STATUS_RESPONSE_SIZE_LFP &&
+        if (dataLen != STATUS_RESPONSE_SIZE_STFT &&
+            dataLen != STATUS_RESPONSE_SIZE_LFP &&
             dataLen != STATUS_RESPONSE_SIZE_RHD &&
             dataLen != STATUS_RESPONSE_SIZE_AUXCTRL &&
             dataLen != STATUS_RESPONSE_SIZE_PERF &&
@@ -542,6 +560,29 @@ public:
             p += 3;  // reserved
         }
 
+        // STFT/Tier-2 engine config + status (firmware fw >= 1.3, status >= 184).
+        status.hasStftStatus = false;
+        status.stftEnabled = false;
+        status.stftNfftLog2 = 0;
+        status.stftK = 0;
+        status.stftOverflow = false;
+        status.stftHop = 0;
+        status.stftFrameSeq = 0;
+        status.stftPacketsSent = 0;
+        if (dataLen >= STATUS_RESPONSE_SIZE_STFT) {
+            status.hasStftStatus = true;
+            status.stftEnabled  = (*p++) != 0;
+            status.stftNfftLog2 = *p++;
+            status.stftK        = *p++;
+            status.stftOverflow = (*p++) != 0;
+            status.stftHop      = (uint16_t)(p[0] | (p[1] << 8)); p += 2;
+            p += 2;  // stft_reserved
+            status.stftFrameSeq    = unpackU32LE(p); p += 4;
+            status.stftPacketsSent = unpackU32LE(p); p += 4;
+            // 8 bytes of playback config follow; not yet exposed.
+            p += 8;
+        }
+
         return true;
     }
 
@@ -632,6 +673,43 @@ public:
         return true;
     }
 
+    // STFT / Tier-2 engine (firmware fw >= 1.3). Direct passthroughs to the
+    // firmware; the host owns N / hop / channel selector / Hann window.
+    bool stftEnable(bool on) {
+        return sendCommand(CMD_STFT_ENABLE, on ? 1 : 0);
+    }
+    bool stftSetParams(uint8_t nfftLog2, uint16_t hop) {
+        return sendCommand(CMD_STFT_SET_PARAMS,
+                           (uint32_t)(nfftLog2 & 0xF),
+                           (uint32_t)(hop & 0xFFFF));
+    }
+    bool stftSetChannelEntry(bool clearFirst, uint8_t sourceChannel) {
+        return sendCommand(CMD_STFT_SET_CHANNELS,
+                           clearFirst ? 1u : 0u,
+                           (uint32_t)sourceChannel);
+    }
+    bool stftUploadChannels(const std::vector<uint8_t>& channels) {
+        bool first = true;
+        for (uint8_t c : channels) {
+            if (!stftSetChannelEntry(first, c)) return false;
+            first = false;
+        }
+        return true;
+    }
+    bool stftWriteWindowTap(bool clearFirst, int16_t coefQ15) {
+        return sendCommand(CMD_STFT_WRITE_WINDOW,
+                           clearFirst ? 1u : 0u,
+                           (uint32_t)((uint16_t)coefQ15));
+    }
+    bool stftUploadWindow(const std::vector<int16_t>& taps) {
+        bool first = true;
+        for (int16_t t : taps) {
+            if (!stftWriteWindowTap(first, t)) return false;
+            first = false;
+        }
+        return true;
+    }
+
     void setDataCallback(DataCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         dataCallback_ = callback;
@@ -640,6 +718,11 @@ public:
     void setLfpDataCallback(LfpDataCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         lfpDataCallback_ = callback;
+    }
+
+    void setStftDataCallback(StftDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        stftDataCallback_ = callback;
     }
 
     void setErrorCallback(ErrorCallback callback) {
@@ -1152,7 +1235,131 @@ public:
         }
         if (cb) cb(frame);
     }
-    
+
+    // STFT UDP listener (fixed port 5003 per the firmware protocol). Jumbo
+    // datagrams (~8 KB at the default; up to ~33 KB at N=64 K=32 nbins=33;
+    // higher with larger N), so set SO_RCVBUF big and require the NIC to be
+    // jumbo-MTU capable. Wire format (32-bit LE):
+    //   word 0-1 : magic {0x5DEC7A00, 0xCAFEBABE}
+    //   word 2-3 : 64-bit timestamp (~LFP frame index)
+    //   word 4   : [7:0] nfft_log2 | [15:8] K | [31:24] flags (bit0 = overflow)
+    //   word 5   : 32-bit frame sequence (mod 2^30)
+    //   word 6   : [15:0] nbins (= N/2+1) | [31:16] hop
+    //   word 7   : reserved
+    //   word 8+  : per lane (lane-major), nbins complex float32 (re, im)
+    static constexpr uint32_t STFT_MAGIC_LOW    = 0x5DEC7A00;
+    static constexpr uint32_t STFT_MAGIC_HIGH   = 0xCAFEBABE;
+    static constexpr uint16_t STFT_UDP_PORT_DEF = 5003;
+    static constexpr size_t   STFT_HEADER_BYTES = 32;   // 8 words
+
+    void stftListenerThread() {
+        stftSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (stftSocket_ == INVALID_SOCKET) {
+            std::cout << "[IntanInterface] STFT listener: socket() failed" << std::endl;
+            return;
+        }
+
+        int reuse = 1;
+        setsockopt(stftSocket_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(stftSocket_, SOL_SOCKET, SO_REUSEPORT,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#endif
+        // Large receive buffer for jumbo frames. recv() drops without warning
+        // if the kernel buffer can't hold a burst, so push for plenty of margin.
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(stftSocket_, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<char*>(&rcvbuf), sizeof(rcvbuf));
+
+        struct sockaddr_in bindAddr;
+        std::memset(&bindAddr, 0, sizeof(bindAddr));
+        bindAddr.sin_family = AF_INET;
+        bindAddr.sin_addr.s_addr = INADDR_ANY;
+        bindAddr.sin_port = htons(STFT_UDP_PORT_DEF);
+
+        if (bind(stftSocket_, reinterpret_cast<struct sockaddr*>(&bindAddr),
+                sizeof(bindAddr)) == SOCKET_ERROR) {
+            std::cout << "[IntanInterface] STFT listener: bind to port "
+                      << STFT_UDP_PORT_DEF << " FAILED (errno="
+                      << errno << ")" << std::endl;
+            closesocket(stftSocket_);
+            stftSocket_ = INVALID_SOCKET;
+            return;
+        }
+
+        std::cout << "[IntanInterface] STFT listener: bound on port "
+                  << STFT_UDP_PORT_DEF << std::endl;
+
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(stftSocket_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<char*>(&tv), sizeof(tv));
+
+        // 65535 = max UDP datagram. Plenty for K*nbins*2 float32 + header.
+        std::vector<uint8_t> buffer(65535);
+
+        while (running_.load()) {
+            struct sockaddr_in senderAddr;
+            socklen_t senderLen = sizeof(senderAddr);
+            int received = recvfrom(stftSocket_, reinterpret_cast<char*>(buffer.data()),
+                                    buffer.size(), 0,
+                                    reinterpret_cast<struct sockaddr*>(&senderAddr),
+                                    &senderLen);
+            if (received > 0) {
+                processStftDatagram(buffer.data(), received);
+            }
+        }
+    }
+
+    void processStftDatagram(const uint8_t* data, size_t len) {
+        if (len < STFT_HEADER_BYTES) return;
+
+        uint32_t magicLo = unpackU32LE(data);
+        uint32_t magicHi = unpackU32LE(data + 4);
+        if (magicLo != STFT_MAGIC_LOW || magicHi != STFT_MAGIC_HIGH) return;
+
+        uint64_t timestamp = (uint64_t)unpackU32LE(data + 8) |
+                             ((uint64_t)unpackU32LE(data + 12) << 32);
+        uint32_t w4   = unpackU32LE(data + 16);
+        uint32_t seq  = unpackU32LE(data + 20);
+        uint32_t w6   = unpackU32LE(data + 24);
+        // word 7 (data + 28) is reserved.
+
+        uint8_t  nfftLog2 = (uint8_t)(w4 & 0xFF);
+        uint8_t  K        = (uint8_t)((w4 >> 8) & 0xFF);
+        bool     overflow = ((w4 >> 24) & 0x1) != 0;
+        uint16_t nbins    = (uint16_t)(w6 & 0xFFFF);
+        uint16_t hop      = (uint16_t)((w6 >> 16) & 0xFFFF);
+
+        // Sanity: payload byte count must be exactly K * nbins * 2 * sizeof(float).
+        size_t expectedFloats = (size_t)K * (size_t)nbins * 2;
+        size_t expectedBytes  = expectedFloats * sizeof(float);
+        size_t available      = len - STFT_HEADER_BYTES;
+        if (available < expectedBytes) return;     // truncated / wrong cfg
+
+        const float* samples = reinterpret_cast<const float*>(data + STFT_HEADER_BYTES);
+
+        StftFrame frame;
+        frame.timestamp     = timestamp;
+        frame.frameSequence = seq;
+        frame.nfftLog2      = nfftLog2;
+        frame.K             = K;
+        frame.hop           = hop;
+        frame.nbins         = nbins;
+        frame.overflow      = overflow;
+        frame.samples       = samples;
+        frame.sampleCount   = expectedFloats;
+
+        StftDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = stftDataCallback_;
+        }
+        if (cb) cb(frame);
+    }
+
     void processUdpData(const uint8_t* data, size_t len) {
         size_t expectedBytes = expectedPacketSizeWords_ * 4;
         
@@ -1502,10 +1709,12 @@ public:
     SOCKET tcpSocket_;
     SOCKET udpSocket_;
     SOCKET lfpSocket_;
+    SOCKET stftSocket_;
     
     // Threading
     std::thread udpThread_;
     std::thread lfpThread_;
+    std::thread stftThread_;
     std::atomic<bool> running_;
     std::atomic<bool> connected_;
     mutable std::mutex tcpMutex_;
@@ -1530,6 +1739,7 @@ public:
     // Callbacks
     DataCallback dataCallback_;
     LfpDataCallback lfpDataCallback_;
+    StftDataCallback stftDataCallback_;
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -1670,6 +1880,49 @@ bool IntanInterface::lfpUploadCoefs(const std::vector<int32_t>& coefs) {
     return pImpl_->lfpUploadCoefs(coefs);
 }
 
+bool IntanInterface::stftEnable(bool on) {
+    return pImpl_->stftEnable(on);
+}
+
+bool IntanInterface::stftSetParams(uint8_t nfftLog2, uint16_t hop) {
+    return pImpl_->stftSetParams(nfftLog2, hop);
+}
+
+bool IntanInterface::stftSetChannelEntry(bool clearFirst, uint8_t sourceChannel) {
+    return pImpl_->stftSetChannelEntry(clearFirst, sourceChannel);
+}
+
+bool IntanInterface::stftUploadChannels(const std::vector<uint8_t>& channels) {
+    return pImpl_->stftUploadChannels(channels);
+}
+
+bool IntanInterface::stftWriteWindowTap(bool clearFirst, int16_t coefQ15) {
+    return pImpl_->stftWriteWindowTap(clearFirst, coefQ15);
+}
+
+bool IntanInterface::stftUploadWindow(const std::vector<int16_t>& taps) {
+    return pImpl_->stftUploadWindow(taps);
+}
+
+// Hann window, signed Q15. Exact port of net.py's design_stft_window().
+std::vector<int16_t> IntanInterface::stftDesignHann(int n) {
+    std::vector<int16_t> w(n);
+    if (n <= 1) {
+        if (n == 1) w[0] = StftDefaults::Q15_FULL;
+        return w;
+    }
+    const double denom = (double)(n - 1);
+    for (int k = 0; k < n; ++k) {
+        double v = (0.5 - 0.5 * std::cos(2.0 * M_PI * (double)k / denom))
+                   * (double)StftDefaults::Q15_FULL;
+        long long q = (long long)std::llround(v);
+        if (q >  32767) q =  32767;
+        if (q < -32768) q = -32768;
+        w[k] = (int16_t)q;
+    }
+    return w;
+}
+
 // Windowed-sinc (Hamming) low-pass FIR, unity DC gain, quantized to Q1.17
 // signed. Exact port of remote/net.py design_lfp_lowpass() so the plugin
 // and net.py produce bit-identical kernels at the same params.
@@ -1713,6 +1966,10 @@ void IntanInterface::setDataCallback(DataCallback callback) {
 
 void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
     pImpl_->setLfpDataCallback(callback);
+}
+
+void IntanInterface::setStftDataCallback(StftDataCallback callback) {
+    pImpl_->setStftDataCallback(callback);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {

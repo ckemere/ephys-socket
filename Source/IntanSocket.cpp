@@ -153,6 +153,16 @@ bool IntanSocket::connectDevice(bool printOutput)
             }
         );
 
+        // STFT callback: one jumbo frame per pass on UDP 5003. Phase 1 just
+        // logs the first few frames + seq drops; phase 2 will feed a
+        // visualizer. Bound unconditionally so a runtime stft_enable is live
+        // without reconnect.
+        intanInterface->setStftDataCallback(
+            [this](const IntanInterface::StftFrame& f) {
+                processStftFrame(f);
+            }
+        );
+
         // Set up error callback
         intanInterface->setErrorCallback(
             [this, printOutput](const std::string& error) {
@@ -685,6 +695,56 @@ void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
                                   &lfpTimestamp,
                                   &eventState,
                                   1);  // ONE time sample
+}
+
+void IntanSocket::processStftFrame(const IntanInterface::StftFrame& frame)
+{
+    // Phase 1: log the first few frames and any seq gaps. Phase 2 will hand
+    // the data off to the spectrogram canvas.
+    uint64_t n = stftFramesReceived.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    uint32_t prev = stftLastSeq.exchange(frame.frameSequence,
+                                         std::memory_order_relaxed);
+    if (prev != 0xFFFFFFFFu) {
+        uint32_t expected = (prev + 1) & 0x3FFFFFFFu;
+        if (frame.frameSequence != expected) {
+            stftSeqGaps.fetch_add(1, std::memory_order_relaxed);
+            LOGD("STFT seq gap ", (int64)prev, " -> ", (int64)frame.frameSequence);
+        }
+    }
+
+    // Log the first 5 frames + every 200th frame thereafter, with a quick
+    // lane-0 power dump (mirrors net.py receive_stft's sanity print). N = 64,
+    // K = 32, nbins = 33 -> 64 * 33 * 2 = 4224 floats / lane (lane0 = first 66
+    // floats in lane-major order).
+    bool logThis = (n <= 5) || (n % 200 == 0);
+    if (!logThis) return;
+
+    int N = 1 << frame.nfftLog2;
+    int nbins = frame.nbins;
+    // Lane-0 bins 0..min(nbins,4): print magnitude in linear units; quick eye
+    // on the diagonal during the chirp test.
+    String laneMag = "[";
+    int laneOff = 0;       // lane 0 starts at index 0 (lane-major payload)
+    int limit = std::min(4, nbins);
+    for (int b = 0; b < limit; ++b) {
+        float re = frame.samples[laneOff + b * 2];
+        float im = frame.samples[laneOff + b * 2 + 1];
+        float p  = std::sqrt(re * re + im * im);
+        if (b > 0) laneMag += " ";
+        laneMag += String(p, 3);
+    }
+    laneMag += "]";
+
+    LOGC("[STFT] frame=", (int64)n,
+         " seq=", (int64)frame.frameSequence,
+         " ts=", (int64)frame.timestamp,
+         " N=", N, " K=", (int)frame.K,
+         " hop=", (int)frame.hop,
+         " nbins=", nbins,
+         (frame.overflow ? " ov=Y" : " ov=N"),
+         " lane0_mag(0..", (limit - 1), ")=", laneMag,
+         " gaps=", (int64)stftSeqGaps.load(std::memory_order_relaxed));
 }
 
 bool IntanSocket::updateBuffer()
