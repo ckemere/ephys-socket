@@ -129,9 +129,11 @@ private:
     std::unique_ptr<UtilityButton> fastSettleButton;  // toggle software fast settle
     std::unique_ptr<UtilityButton> auxModeButton;     // toggle banked-aux/accel mode
     std::unique_ptr<UtilityButton> lfpEnableButton;   // toggle LFP/DSP engine + 2nd stream
+    std::unique_ptr<UtilityButton> stftEnableButton;  // toggle STFT engine + 3rd stream
     bool fastSettleActive;
     bool auxModeActive;
     bool lfpActive;
+    bool stftActive;
 
     /** Refresh the tooling buttons' labels/colors from node state */
     void refreshAuxButtons();

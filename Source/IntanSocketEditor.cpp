@@ -270,9 +270,23 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     addAndMakeVisible(lfpEnableButton.get());
     lfpEnableButton->setEnabledState(false);
 
+    stftEnableButton = std::make_unique<UtilityButton>("STFT");
+    stftEnableButton->setFont(FontOptions("Small Text", 12, Font::bold));
+    stftEnableButton->setRadius(3.0f);
+    stftEnableButton->setBounds(345, 128, 72, 18);
+    stftEnableButton->addListener(this);
+    stftEnableButton->setTooltip("Toggle the firmware STFT engine + 3rd UDP stream "
+                                 "(port 5003) feeding the spectrogram tab. Applies "
+                                 "net.py defaults (N=64, hop=1, Hann, K = engine "
+                                 "build K) on first enable. LFP must be enabled "
+                                 "first (the STFT taps the LFP datapath).");
+    addAndMakeVisible(stftEnableButton.get());
+    stftEnableButton->setEnabledState(false);
+
     fastSettleActive = false;
     auxModeActive = false;
     lfpActive = false;
+    stftActive = false;
 
     // Sample rate interface
     sampleRateInterface = std::make_unique<SampleRateInterface>(node);
@@ -408,6 +422,15 @@ void IntanSocketEditor::buttonClicked(Button* button)
         }
         refreshAuxButtons();
     }
+    else if (button == stftEnableButton.get())
+    {
+        // STFT doesn't add an OE DataStream (it goes to the visualizer tab
+        // only), so this is safe during acquisition. Just toggle and refresh.
+        bool target = !stftActive;
+        if (node->setStftEnabled(target))
+            stftActive = target;
+        refreshAuxButtons();
+    }
     else if ((button == debugMode1PButton.get() || button == debugMode2PButton.get())
              && !acquisitionIsActive)
     {
@@ -517,6 +540,20 @@ void IntanSocketEditor::refreshAuxButtons()
         lfpEnableButton->setColour(TextButton::buttonColourId,
                                    findColour(TextButton::buttonColourId));
     }
+
+    stftActive = node->isStftEnabled();
+    if (stftActive)
+    {
+        stftEnableButton->setLabel("STFT: ON");
+        stftEnableButton->setColour(TextButton::buttonColourId,
+                                    Colours::blue.darker(0.3f));
+    }
+    else
+    {
+        stftEnableButton->setLabel("STFT");
+        stftEnableButton->setColour(TextButton::buttonColourId,
+                                    findColour(TextButton::buttonColourId));
+    }
 }
 
 void IntanSocketEditor::connected()
@@ -530,6 +567,7 @@ void IntanSocketEditor::connected()
     fastSettleButton->setEnabledState(true);
     auxModeButton->setEnabledState(true);
     lfpEnableButton->setEnabledState(true);
+    stftEnableButton->setEnabledState(true);
     refreshAuxButtons();   // sync with device state (persists across reconnect)
 
     // Pull the TTL fast-settle pin from the device (aux_ctrl readback,
@@ -556,6 +594,7 @@ void IntanSocketEditor::disconnected()
     fastSettleButton->setEnabledState(false);
     auxModeButton->setEnabledState(false);
     lfpEnableButton->setEnabledState(false);
+    stftEnableButton->setEnabledState(false);
 
     // TTL Settle combo: disable while disconnected and reset to "-" so a
     // future reconnect can't silently re-enable the TTL trigger on a freshly

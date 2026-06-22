@@ -258,6 +258,22 @@ bool IntanSocket::connectDevice(bool printOutput)
             lfp_num_channels = 0;
         }
 
+        // STFT state mirror (firmware fw >= 1.3). The visualizer always
+        // listens for STFT frames; this gates the UI button label.
+        if (status.hasStftStatus)
+        {
+            stft_enabled   = status.stftEnabled;
+            stft_nfft_log2 = status.stftNfftLog2;
+            stft_K         = status.stftK;
+            stft_hop       = status.stftHop;
+        }
+        else
+        {
+            stft_enabled = false;
+            stft_nfft_log2 = stft_K = 0;
+            stft_hop = 0;
+        }
+
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
         // pin select. On older firmware, fall back to the live fs_active
@@ -1421,6 +1437,117 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
         LOGC("Aux sequencer enabled - accel de-interleave mode (10 kHz/axis)");
     }
     CoreServices::sendStatusMessage("Intan: aux sequencer active");
+    return true;
+}
+
+// STFT defaults mirror remote/net.py configure_stft(): nfft_log2=6 (N=64),
+// hop=1, channel selector = identity (lane i -> source channel i for i in
+// 0..K-1), Hann window of length N. Caller enables afterwards.
+bool IntanSocket::configureStftDefaults()
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("STFT: device not connected (configureStftDefaults)");
+        return false;
+    }
+    // K isn't a host-controlled value -- the firmware reports the build-time
+    // K via get_status. Read it back so the selector + window line up with
+    // what the engine actually accepts.
+    IntanInterface::DeviceStatus s;
+    if (!intanInterface->getStatus(s))
+    {
+        LOGE("STFT: status read failed before configure");
+        return false;
+    }
+    if (!s.hasStftStatus || s.stftK == 0)
+    {
+        LOGE("STFT: engine not present on this firmware "
+             "(update BOOT.bin to fw >= 1.3)");
+        CoreServices::sendStatusMessage("Intan: firmware lacks STFT engine");
+        return false;
+    }
+    using D = IntanInterface::StftDefaults;
+    int K = s.stftK;
+    int N = 1 << D::NFFT_LOG2;
+
+    if (!intanInterface->stftEnable(false)) return false;
+    if (!intanInterface->stftSetParams(D::NFFT_LOG2, D::HOP)) return false;
+
+    std::vector<uint8_t> chans(K);
+    for (int i = 0; i < K; ++i) chans[i] = (uint8_t)i;
+    if (!intanInterface->stftUploadChannels(chans)) return false;
+
+    auto win = IntanInterface::stftDesignHann(N);
+    if ((int)win.size() != N) return false;
+    if (!intanInterface->stftUploadWindow(win)) return false;
+
+    LOGC("STFT defaults applied: N=", N,
+         " hop=", (int)D::HOP,
+         " K=", K,
+         " window=Hann");
+    return true;
+}
+
+bool IntanSocket::setStftEnabled(bool enable)
+{
+    if (!intanInterface || !intanInterface->foundInputSource())
+    {
+        LOGE("STFT: device not connected");
+        return false;
+    }
+    if (enable)
+    {
+        IntanInterface::DeviceStatus s;
+        if (!intanInterface->getStatus(s))
+        {
+            LOGE("STFT: status read failed before enable");
+            return false;
+        }
+        if (!s.hasStftStatus)
+        {
+            LOGE("STFT: firmware doesn't expose the STFT engine "
+                 "(update BOOT.bin to fw >= 1.3)");
+            CoreServices::sendStatusMessage("Intan: firmware lacks STFT engine");
+            return false;
+        }
+        if (s.stftNfftLog2 == 0)
+        {
+            LOGC("STFT: no firmware config yet -- applying net.py defaults");
+            if (!configureStftDefaults())
+            {
+                LOGE("STFT: default configure failed");
+                CoreServices::sendStatusMessage("Intan: STFT configure failed");
+                return false;
+            }
+        }
+    }
+
+    if (!intanInterface->stftEnable(enable))
+    {
+        LOGE("STFT: ", enable ? "enable" : "disable", " command failed");
+        return false;
+    }
+
+    IntanInterface::DeviceStatus s;
+    if (intanInterface->getStatus(s) && s.hasStftStatus)
+    {
+        stft_enabled   = s.stftEnabled;
+        stft_nfft_log2 = s.stftNfftLog2;
+        stft_K         = s.stftK;
+        stft_hop       = s.stftHop;
+        if (stft_enabled)
+        {
+            int N = 1 << stft_nfft_log2;
+            LOGC("STFT enabled - N=", N, " K=", (int)stft_K,
+                 " hop=", (int)stft_hop);
+            CoreServices::sendStatusMessage("Intan: STFT stream ON");
+        }
+        else
+        {
+            LOGC("STFT disabled");
+            CoreServices::sendStatusMessage("Intan: STFT stream off");
+        }
+    }
     return true;
 }
 

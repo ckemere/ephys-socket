@@ -60,6 +60,14 @@ public:
     uint8_t lfp_num_taps = 0;
     int     lfp_num_channels = 0;   // popcount(lfp_lane_mask) * 32
 
+    // STFT engine state, mirrored from get_status. The Tier-2 engine emits
+    // a parallel UDP stream on port 5003; the canvas reads STFT frames out
+    // of the ring whether or not we publish a DataStream for it.
+    bool     stft_enabled = false;
+    uint8_t  stft_nfft_log2 = 0;
+    uint8_t  stft_K = 0;
+    uint16_t stft_hop = 0;
+
     /** Constructor */
     IntanSocket(SourceNode* sn);
 
@@ -158,6 +166,17 @@ public:
         decim_R=15, num_taps=128, cutoff=600 Hz) -- DOES NOT enable.
         Used by setLfpEnabled(true) when the firmware is fresh. */
     bool configureLfpDefaults();
+
+    /** Enable / disable the firmware's STFT engine + the 3rd UDP stream
+        (port 5003). When enabling and the engine has no configuration yet
+        (nfft_log2 = 0), this first applies a default configure -- the
+        net.py defaults: nfft_log2 = 6, hop = 1, channel selector = 0..K-1,
+        Hann window. Same external-update story as LFP. */
+    bool setStftEnabled(bool enable);
+    bool isStftEnabled() const { return stft_enabled; }
+
+    /** Apply the net.py default STFT configuration (does not enable). */
+    bool configureStftDefaults();
 
 private:
     const int bufferSizeInSeconds = 10;
