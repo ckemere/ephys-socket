@@ -6,6 +6,9 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <deque>
+#include <atomic>
+#include <vector>
 
 namespace IntanSocketNode
 {
@@ -188,6 +191,42 @@ private:
     std::atomic<uint64_t> stftSeqGaps{0};
     std::atomic<uint32_t> stftLastSeq{0xFFFFFFFFu};
 
+public:
+    // ------------------------------------------------------------------
+    // STFT consumer API (used by the spectrogram visualizer).
+    // ------------------------------------------------------------------
+    // One column = one STFT frame. Payload stored verbatim (lane-major raw
+    // complex float32); the canvas computes power for the selected lane.
+    struct StftColumn {
+        uint32_t seq;
+        uint64_t timestamp;
+        uint8_t  K;
+        uint16_t nbins;
+        uint16_t hop;
+        std::vector<float> samples;   // size = K * nbins * 2 (re,im per bin)
+    };
+
+    /** Snapshot of all STFT columns with seq > `sinceSeq`. After return, the
+        caller should set `*sinceSeq` = newest column's seq for the next call.
+        Capped at the internal ring size; older drops are reported via the
+        returned `dropped` count so the visualizer can render a gap. */
+    struct StftDrain {
+        std::vector<StftColumn> columns;
+        uint64_t dropped;             // total drops since session start
+        // Static config (snapshot at the time of drain):
+        int K;
+        int nbins;
+        int hop;
+        int lfpDecimR;                // for Fs_lfp = SAMPLE_RATE / lfpDecimR
+    };
+    StftDrain drainStftSince(uint32_t sinceSeq);
+
+    /** Whether STFT data has been arriving recently. Used by the canvas to
+        decide between "nothing here yet" and "live stream". */
+    bool isStftRunning() const { return stftFramesReceived.load() > 0; }
+
+private:
+
     /** Number of enabled 16-bit data streams in the 8-bit mask.
         Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
         bits 4-7 = port B (B_CIPO0_REG, B_CIPO0_DDR, B_CIPO1_REG, B_CIPO1_DDR). */
@@ -229,6 +268,17 @@ private:
     /** Buffers for conversion */
     std::vector<float> convbuf;
     std::vector<float> lfpConvBuf;
+
+    // STFT ring buffer (producer = listener thread, consumer = visualizer).
+    // Bounded -- old columns are dropped to keep memory in check. 2048
+    // columns at default K=32, N=64 (nbins=33) is ~17 MB.
+    static constexpr int STFT_RING_CAPACITY = 2048;
+    std::deque<StftColumn> stftRing;
+    mutable std::mutex stftRingMu;
+    uint64_t stftDroppedTotal = 0;        // monotonic, for caller "dropped since" math
+    uint8_t  stftK_ = 0;
+    uint16_t stftNbins_ = 0;
+    uint16_t stftHop_ = 0;
     
     /** Sample counter */
     int64 totalSamples;

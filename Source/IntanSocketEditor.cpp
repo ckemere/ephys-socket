@@ -169,7 +169,7 @@ void BandwidthInterface::paint(Graphics& g)
 // ============================================================================
 
 IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* socket)
-    : GenericEditor(parentNode)
+    : VisualizerEditor(parentNode, "STFT", 425)
 {
     node = socket;
     desiredWidth = 425;
@@ -574,6 +574,14 @@ void IntanSocketEditor::updateChipDetection(const IntanInterface::AutoDetectionR
     portAInterface->updateCipo1Status(result.cipo1Detected, result.cipo1ChipType);
     portBInterface->updateCipo0Status(result.portBCipo0Detected, result.portBCipo0ChipType);
     portBInterface->updateCipo1Status(result.portBCipo1Detected, result.portBCipo1ChipType);
+}
+
+Visualizer* IntanSocketEditor::createNewCanvas()
+{
+    // The Visualizer base class takes a GenericProcessor*; we additionally
+    // pass the IntanSocket pointer through so the canvas can drain the STFT
+    // ring without round-tripping through the processor.
+    return new StftCanvas(getProcessor(), node);
 }
 
 void IntanSocketEditor::syncFromDeviceState(uint8_t mask, bool debugOn)

@@ -8,6 +8,7 @@
 #include <VisualizerEditorHeaders.h>
 #include "IntanSocket.h"
 #include "IntanInterface.h"
+#include "StftCanvas.h"
 
 namespace IntanSocketNode
 {
@@ -74,7 +75,7 @@ private:
     void paintChipBox(Graphics& g, int x, bool detected, IntanInterface::ChipType type);
 };
 
-class IntanSocketEditor : public GenericEditor,
+class IntanSocketEditor : public VisualizerEditor,
                           public Button::Listener,
                           public ComboBox::Listener
 {
@@ -84,9 +85,13 @@ public:
 
     /** Button listener callback */
     void buttonClicked(Button* button) override;
-    
+
     /** ComboBox listener callback */
     void comboBoxChanged(ComboBox* comboBox) override;
+
+    /** Create the spectrogram canvas attached to the "Tab" button supplied
+        by VisualizerEditor. Returns Visualizer* per the OE plugin API. */
+    Visualizer* createNewCanvas() override;
 
     /** Called at start of acquisition */
     void startAcquisition() override;

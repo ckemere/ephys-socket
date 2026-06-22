@@ -699,8 +699,29 @@ void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
 
 void IntanSocket::processStftFrame(const IntanInterface::StftFrame& frame)
 {
-    // Phase 1: log the first few frames and any seq gaps. Phase 2 will hand
-    // the data off to the spectrogram canvas.
+    // Push into the ring buffer for the visualizer. Bounded -- we drop the
+    // oldest column when full and bump the dropped counter so the canvas can
+    // detect under-runs. This runs on the listener thread; keep it cheap.
+    {
+        std::lock_guard<std::mutex> lk(stftRingMu);
+        stftK_     = frame.K;
+        stftNbins_ = frame.nbins;
+        stftHop_   = frame.hop;
+
+        if ((int)stftRing.size() >= STFT_RING_CAPACITY) {
+            stftRing.pop_front();
+            ++stftDroppedTotal;
+        }
+        StftColumn col;
+        col.seq       = frame.frameSequence;
+        col.timestamp = frame.timestamp;
+        col.K         = frame.K;
+        col.nbins     = frame.nbins;
+        col.hop       = frame.hop;
+        col.samples.assign(frame.samples, frame.samples + frame.sampleCount);
+        stftRing.emplace_back(std::move(col));
+    }
+
     uint64_t n = stftFramesReceived.fetch_add(1, std::memory_order_relaxed) + 1;
 
     uint32_t prev = stftLastSeq.exchange(frame.frameSequence,
@@ -745,6 +766,36 @@ void IntanSocket::processStftFrame(const IntanInterface::StftFrame& frame)
          (frame.overflow ? " ov=Y" : " ov=N"),
          " lane0_mag(0..", (limit - 1), ")=", laneMag,
          " gaps=", (int64)stftSeqGaps.load(std::memory_order_relaxed));
+}
+
+IntanSocket::StftDrain IntanSocket::drainStftSince(uint32_t sinceSeq)
+{
+    StftDrain out;
+    out.dropped = 0;
+    out.K = out.nbins = out.hop = 0;
+    out.lfpDecimR = (lfp_decim_R > 0) ? (int)lfp_decim_R : 15;
+
+    std::lock_guard<std::mutex> lk(stftRingMu);
+    out.K = stftK_;
+    out.nbins = stftNbins_;
+    out.hop = stftHop_;
+    out.dropped = stftDroppedTotal;
+
+    // sinceSeq == sentinel means "give me everything in the ring".
+    bool wantAll = (sinceSeq == 0xFFFFFFFFu);
+    // Frames arrive in monotonic-mod-2^30 order; we find the first column
+    // strictly after sinceSeq. Linear scan is fine (deque is small + dense).
+    auto it = stftRing.begin();
+    if (!wantAll) {
+        for (; it != stftRing.end(); ++it) {
+            // Modulo-aware "is `it->seq` after sinceSeq" -- safe for the
+            // protocol's 30-bit counter under any plausible gap.
+            uint32_t diff = (it->seq - sinceSeq) & 0x3FFFFFFFu;
+            if (diff != 0 && diff < 0x20000000u) break;
+        }
+    }
+    out.columns.assign(it, stftRing.end());
+    return out;
 }
 
 bool IntanSocket::updateBuffer()
