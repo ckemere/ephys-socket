@@ -637,12 +637,26 @@ public:
     /** Convenience: upload a full coefficient set in order (first call clears). */
     bool lfpUploadCoefs(const std::vector<int32_t>& coefs);
 
-    /** Default LFP-engine parameters (mirror remote/net.py configure_lfp). */
+    /** Default LFP-engine parameters (mirror remote/net.py configure_lfp).
+     *
+     *  NOTE: these are only the *defaults* the plugin pushes when the firmware
+     *  LFP engine has never been configured since boot. The published
+     *  DataStream rate and timestamp alignment are always DERIVED from the
+     *  decim_R field carried in each LFP UDP packet (see processLfpDatagram /
+     *  DeviceStatus.lfpDecimR -> IntanSocket::lfp_decim_R), so the plugin
+     *  auto-tracks whatever rate the firmware actually runs. Changing DECIM_R
+     *  here only changes what default the plugin configures, not what it can
+     *  receive.
+     *
+     *  CUTOFF_HZ must stay below the output Nyquist = FS / (2 * DECIM_R):
+     *    R=15 -> 1000 Hz Nyquist,  R=10 -> 1500 Hz Nyquist.
+     *  600 Hz is valid for both, so the FIR coefficient set is unchanged.
+     */
     struct LfpDefaults {
         static constexpr uint8_t LANE_MASK = 0x0F;     // port A, all 4 streams
-        static constexpr uint8_t DECIM_R   = 15;       // 30000 / 15 = 2000 Hz
+        static constexpr uint8_t DECIM_R   = 10;       // 30000 / 10 = 3000 Hz (was 15 -> 2000 Hz)
         static constexpr uint8_t NUM_TAPS  = 128;
-        static constexpr double  CUTOFF_HZ = 600.0;
+        static constexpr double  CUTOFF_HZ = 600.0;    // < FS/(2*DECIM_R) = 1500 Hz @ R=10
         static constexpr double  FS        = 30000.0;
         static constexpr int     COEF_FRAC = 17;       // Q1.17
     };

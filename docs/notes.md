@@ -42,7 +42,7 @@ response.
 plugin. Use `remote/net.py` from the MicroZedIntanInterface repo:
 
 ```python
-configure_lfp(sock, lane_mask=0x0F, decim_R=15, num_taps=128, cutoff_hz=600.0)
+configure_lfp(sock, lane_mask=0x0F, decim_R=10, num_taps=128, cutoff_hz=600.0)
 lfp_enable(sock, True)
 ```
 

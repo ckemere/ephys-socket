@@ -143,7 +143,7 @@ public:
         UDP stream (port 5001). When enabling and the firmware has no
         configuration yet (lane_mask = 0 or decim_R = 0), this first
         applies a default configure -- same values as remote/net.py's
-        configure_lfp(): 0x0F lane mask, decim 15 (2 kHz output), 128-tap
+        configure_lfp(): 0x0F lane mask, decim 10 (3 kHz output), 128-tap
         Hamming-windowed sinc with 600 Hz cutoff. Filter UPDATES still go
         through the external tool. Caller is expected to invoke
         CoreServices::updateSignalChain afterwards so the stream count
@@ -152,7 +152,7 @@ public:
     bool isLfpEnabled() const { return lfp_enabled; }
 
     /** Apply the net.py default LFP configuration (lane_mask=0x0F,
-        decim_R=15, num_taps=128, cutoff=600 Hz) -- DOES NOT enable.
+        decim_R=10, num_taps=128, cutoff=600 Hz) -- DOES NOT enable.
         Used by setLfpEnabled(true) when the firmware is fresh. */
     bool configureLfpDefaults();
 

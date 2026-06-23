@@ -19,9 +19,16 @@ Default values (same as `net.py` `configure_lfp(...)` defaults):
 | Param | Value | Meaning |
 |---|---|---|
 | `lane_mask` | `0x0F` | port A, all 4 streams (128 amplifier channels) |
-| `decim_R` | `15` | 30 kHz / 15 = **2 kHz** output sample rate |
+| `decim_R` | `10` | 30 kHz / 10 = **3 kHz** output sample rate |
 | `num_taps` | `128` | FIR length |
 | `cutoff_hz` | `600` | windowed-sinc (Hamming) LP, unity DC gain, Q1.17 |
+
+> The plugin does **not** hardcode the 3 kHz figure into the published
+> DataStream — it reads `decim_R` from every LFP UDP packet (header word 4,
+> bits 15:8) and publishes `30000 / decim_R` Hz, with timestamps in
+> broadband ticks (`frame_seq * decim_R`). So the stream auto-tracks the
+> firmware's actual rate; `decim_R` above is only the value the plugin
+> *configures* when the engine is unconfigured.
 
 The C++ designer is a bit-identical port of `design_lfp_lowpass()` in
 net.py — same coefficient set, same quantization.
@@ -46,7 +53,7 @@ sock = tcp_connect('192.168.18.10')          # board IP
 configure_lfp(
     sock,
     lane_mask=0x0F,    # which broadband streams to LFP-filter
-    decim_R=15,        # 30000 / 15 = 2000 Hz output
+    decim_R=10,        # 30000 / 10 = 3000 Hz output
     num_taps=128,      # FIR length
     cutoff_hz=600.0    # passband cutoff
 )
@@ -62,15 +69,15 @@ the new LFP stream (the channel count + sample rate are fixed at
 | Parameter | Meaning | Notes |
 |---|---|---|
 | `lane_mask` | 8-bit, same convention as broadband (bits 0..3 port A, 4..7 port B) | Bit set ⇒ that lane's 32 amplifier channels get LFP-filtered |
-| `decim_R` | broadband_rate / output_rate | Powers of 2 keep the FIR aliasing math clean; `decim_R=15` → 2 kHz is the lab default |
-| `num_taps` | active FIR length | Bounded by the firmware's FIR engine (see protocol.md); 128 is plenty for the 2 kHz LP |
+| `decim_R` | broadband_rate / output_rate | `decim_R=10` → 3 kHz is the lab default (was 15 → 2 kHz) |
+| `num_taps` | active FIR length | Bounded by the firmware's FIR engine (see protocol.md); 128 is plenty for the 600 Hz LP |
 | `cutoff_hz` | passband edge of the LP design | Must be `< fs / (2 × decim_R)` (Nyquist of the output rate) |
 
 ## Validating that data is flowing
 
 - **From the plugin**: click STATUS — the device-status dump now ends with
-  an LFP block (`ENABLED  mask=0x0F (4 streams / 128 ch)  decim=15
-  (2000 Hz)  taps=128`). The `Packets sent` counter should be advancing
+  an LFP block (`ENABLED  mask=0x0F (4 streams / 128 ch)  decim=10
+  (3000 Hz)  taps=128`). The `Packets sent` counter should be advancing
   if streaming is live.
 - **In OE**: a second `DataStream` ("IntanLFP") appears in the signal
   chain after reconnect, with the configured channel count + sample rate.
