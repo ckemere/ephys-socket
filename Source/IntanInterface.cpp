@@ -48,11 +48,17 @@ namespace {
     //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
     //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
     //  160  bytes  + lfp engine config + status              -- 0e99881
+    //  168  bytes  + analytic chirp NCO config (mode/stride/fspan/rate)
     // The buffer must be sized to the largest known form, or extra bytes will
     // sit unread in the TCP queue and corrupt the next command's ACK. The
     // parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and decodes
-    // optional fields based on what the device actually sent.
-    constexpr size_t STATUS_RESPONSE_SIZE = 160;
+    // optional fields based on what the device actually sent -- any trailing
+    // bytes beyond the last block we parse are recv'd into the buffer (so the
+    // socket stays clean) but left unread, which is harmless. To make this
+    // survive future firmware growth without code changes, the receive buffer
+    // is sized with headroom above the current max.
+    constexpr size_t STATUS_RESPONSE_SIZE = 256;
+    constexpr size_t STATUS_RESPONSE_SIZE_CHIRP = 168;
     constexpr size_t STATUS_RESPONSE_SIZE_LFP = 160;
     constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
@@ -406,13 +412,13 @@ public:
             return false;
         }
 
-        // Accept any of the known sizes (see STATUS_RESPONSE_SIZE comment).
-        if (dataLen != STATUS_RESPONSE_SIZE_LFP &&
-            dataLen != STATUS_RESPONSE_SIZE_RHD &&
-            dataLen != STATUS_RESPONSE_SIZE_AUXCTRL &&
-            dataLen != STATUS_RESPONSE_SIZE_PERF &&
-            dataLen != STATUS_RESPONSE_SIZE_AUX &&
-            dataLen != STATUS_RESPONSE_SIZE_LEGACY) {
+        // Accept any size at or above the oldest known layout. Each optional
+        // block below is gated on dataLen >= its introduction-size constant, so
+        // newer firmware that adds fields past the LFP block (e.g. the 168-byte
+        // analytic chirp NCO config) is consumed cleanly and the tail is just
+        // left unparsed. Rejecting unknown larger sizes here would break every
+        // future firmware bump (see git log -- this branch hit exactly that).
+        if (dataLen < STATUS_RESPONSE_SIZE_LEGACY) {
             return false;
         }
         
