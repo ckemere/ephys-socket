@@ -278,6 +278,48 @@ public:
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
 
     /**
+     * @brief Wavelet (DWT) scalogram column metadata (decoded once per UDP
+     * datagram on port 5004). ONE datagram == one scalogram column (all K
+     * lanes x nscales complex bins at one time step). Mirrors
+     * remote/net.py::receive_wavelet.
+     *
+     * Wire layout (32-bit LE words):
+     *   0-1 magic {0x5CA70900 ("SCALOG"), 0xCAFEBABE}
+     *   2-3 64-bit timestamp (word 2 == frame seq, word 3 = 0)
+     *   4   [7:0] n_octaves | [15:8] n_voices | [23:16] K | [24] overrun
+     *   5   32-bit frame sequence (mod 2^30)
+     *   6   [15:0] nscales (= n_octaves*n_voices) | [31:16] n_taps
+     *   7   gain word
+     *   8+  per lane (lane-major), nscales complex INT32 (re, im)
+     *
+     * Lane L, scale s (s = octave*n_voices + voice; bin 0 = highest frequency):
+     *   re = samples[L * nscales * 2 + s * 2 + 0]
+     *   im = samples[L * nscales * 2 + s * 2 + 1]
+     *   magnitude = sqrt(re*re + im*im)
+     */
+    struct WaveletFrame {
+        uint64_t timestamp;
+        uint32_t frameSequence;
+        uint8_t  nOctaves;
+        uint8_t  nVoices;
+        uint8_t  K;              // selected lanes (one source channel each)
+        uint16_t nscales;        // n_octaves * n_voices
+        uint16_t nTaps;          // complex taps/voice
+        uint32_t gain;           // per-octave gain word (4-bit shifts, low octave first)
+        bool     overrun;        // sticky compute-overrun flag
+        // Payload pointer + lane/scale stride. Valid only for the callback's
+        // lifetime; copy whatever you keep. Layout (lane-major), signed int32.
+        const int32_t* samples;
+        size_t   sampleCount;    // == K * nscales * 2
+    };
+
+    /**
+     * @brief Callback type for receiving a wavelet scalogram column
+     * (UDP port 5004). Invoked from the wavelet listener thread.
+     */
+    using WaveletDataCallback = std::function<void(const WaveletFrame&)>;
+
+    /**
      * @brief Callback type for error notifications
      *
      * @param errorMessage Human-readable error description
@@ -691,6 +733,15 @@ public:
      * the callback; copy what you need.
      */
     void setLfpDataCallback(LfpDataCallback callback);
+
+    /**
+     * @brief Register callback for wavelet scalogram columns (UDP port 5004).
+     *
+     * Invoked from the wavelet listener thread for every well-formed
+     * datagram (one scalogram column). The samples pointer in WaveletFrame is
+     * valid only for the duration of the callback; copy what you need.
+     */
+    void setWaveletDataCallback(WaveletDataCallback callback);
 
     /**
      * @brief Register callback for error notifications

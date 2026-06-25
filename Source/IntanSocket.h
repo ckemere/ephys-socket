@@ -6,6 +6,9 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <deque>
+#include <atomic>
+#include <vector>
 
 namespace IntanSocketNode
 {
@@ -155,6 +158,65 @@ public:
         decim_R=10, num_taps=128, cutoff=600 Hz) -- DOES NOT enable.
         Used by setLfpEnabled(true) when the firmware is fresh. */
     bool configureLfpDefaults();
+
+    // ------------------------------------------------------------------
+    // Wavelet (DWT) scalogram consumer API (used by the DwtCanvas viewer).
+    // The wavelet engine (mz-tier3-wavelet firmware) emits one UDP datagram
+    // per scalogram COLUMN on port 5004; IntanInterface decodes it and calls
+    // processWaveletFrame(), which parks the column in waveletRing. The canvas
+    // drains the ring each refresh. The engine config + enable live in the
+    // wavelet firmware / remote/net.py (configure_wavelet, wavelet_enable);
+    // this plugin only consumes the monitor stream. The packet header is fully
+    // self-describing (n_oct/n_voc/K/nscales), so the viewer works regardless
+    // of whether get_status surfaces wavelet config.
+    // ------------------------------------------------------------------
+    // One column = one wavelet datagram. Magnitudes are stored (sqrt(re^2+im^2)
+    // computed in the canvas from the raw int32 payload kept here).
+public:
+    struct WaveletColumn {
+        uint32_t seq;
+        uint64_t timestamp;
+        uint8_t  K;
+        uint16_t nscales;
+        std::vector<int32_t> samples;   // size = K * nscales * 2 (re,im per bin)
+    };
+
+    /** Snapshot of all wavelet columns with seq > `sinceSeq`. The caller sets
+        the returned newest column's seq as `sinceSeq` for the next call.
+        Capped at the ring size; older drops are reported via `dropped`. */
+    struct WaveletDrain {
+        std::vector<WaveletColumn> columns;
+        uint64_t dropped;             // total drops since session start
+        int K;
+        int nscales;
+        int nOct;
+        int nVoc;
+    };
+    WaveletDrain drainWaveletSince(uint32_t sinceSeq);
+
+    /** Whether wavelet data has been arriving (any column since session start). */
+    bool isWaveletRunning() const { return waveletColumnsReceived.load() > 0; }
+
+private:
+
+    /** Park one wavelet scalogram column (from the IntanInterface wavelet
+        listener) into waveletRing for the visualizer. Runs on the listener
+        thread; keep it cheap. */
+    void processWaveletFrame(const IntanInterface::WaveletFrame& frame);
+
+    // Wavelet ring buffer (producer = listener thread, consumer = visualizer).
+    // 2048 columns at K=32, nscales=32 is ~16 MB.
+    static constexpr int WAVELET_RING_CAPACITY = 2048;
+    std::deque<WaveletColumn> waveletRing;
+    mutable std::mutex waveletRingMu;
+    uint64_t waveletDroppedTotal = 0;
+    uint8_t  waveletK_ = 0;
+    uint16_t waveletNscales_ = 0;
+    uint8_t  waveletNOct_ = 0;
+    uint8_t  waveletNVoc_ = 0;
+    std::atomic<uint64_t> waveletColumnsReceived{0};
+    std::atomic<uint64_t> waveletSeqGaps{0};
+    std::atomic<uint32_t> waveletLastSeq{0xFFFFFFFFu};
 
 private:
     const int bufferSizeInSeconds = 10;

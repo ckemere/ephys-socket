@@ -153,6 +153,16 @@ bool IntanSocket::connectDevice(bool printOutput)
             }
         );
 
+        // Wavelet (DWT) scalogram callback: one column per datagram on UDP
+        // 5004. Always wired -- silently does nothing until the wavelet engine
+        // is enabled in the firmware (remote/net.py configure_wavelet +
+        // wavelet_enable). Feeds the DwtCanvas scalogram tab.
+        intanInterface->setWaveletDataCallback(
+            [this](const IntanInterface::WaveletFrame& f) {
+                processWaveletFrame(f);
+            }
+        );
+
         // Set up error callback
         intanInterface->setErrorCallback(
             [this, printOutput](const std::string& error) {
@@ -685,6 +695,93 @@ void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
                                   &lfpTimestamp,
                                   &eventState,
                                   1);  // ONE time sample
+}
+
+void IntanSocket::processWaveletFrame(const IntanInterface::WaveletFrame& frame)
+{
+    // Park the column in the ring for the DwtCanvas. Bounded -- drop the oldest
+    // when full and bump the dropped counter so the canvas can report gaps.
+    // This runs on the wavelet listener thread; keep it cheap (one copy).
+    {
+        std::lock_guard<std::mutex> lk(waveletRingMu);
+        waveletK_       = frame.K;
+        waveletNscales_ = frame.nscales;
+        waveletNOct_    = frame.nOctaves;
+        waveletNVoc_    = frame.nVoices;
+
+        if ((int)waveletRing.size() >= WAVELET_RING_CAPACITY) {
+            waveletRing.pop_front();
+            ++waveletDroppedTotal;
+        }
+        WaveletColumn col;
+        col.seq       = frame.frameSequence;
+        col.timestamp = frame.timestamp;
+        col.K         = frame.K;
+        col.nscales   = frame.nscales;
+        col.samples.assign(frame.samples, frame.samples + frame.sampleCount);
+        waveletRing.emplace_back(std::move(col));
+    }
+
+    uint64_t n = waveletColumnsReceived.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    uint32_t prev = waveletLastSeq.exchange(frame.frameSequence,
+                                            std::memory_order_relaxed);
+    if (prev != 0xFFFFFFFFu) {
+        uint32_t expected = (prev + 1) & 0x3FFFFFFFu;
+        if (frame.frameSequence != expected)
+            waveletSeqGaps.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Log the first few + every 200th column, with a lane-0 magnitude peek
+    // (mirrors net.py receive_wavelet's sanity print).
+    bool logThis = (n <= 5) || (n % 200 == 0);
+    if (!logThis) return;
+
+    int ns = frame.nscales;
+    String laneMag = "[";
+    int limit = std::min(6, ns);
+    for (int s = 0; s < limit; ++s) {
+        double re = (double)frame.samples[s * 2 + 0];   // lane 0 starts at index 0
+        double im = (double)frame.samples[s * 2 + 1];
+        if (s > 0) laneMag += " ";
+        laneMag += String((float)std::sqrt(re * re + im * im), 1);
+    }
+    laneMag += "]";
+
+    LOGC("[WAV] col=", (int64)n,
+         " seq=", (int64)frame.frameSequence,
+         " oct=", (int)frame.nOctaves, " V=", (int)frame.nVoices,
+         " K=", (int)frame.K, " scales=", ns,
+         (frame.overrun ? " ov=Y" : " ov=N"),
+         " lane0_mag=", laneMag,
+         " gaps=", (int64)waveletSeqGaps.load(std::memory_order_relaxed));
+}
+
+IntanSocket::WaveletDrain IntanSocket::drainWaveletSince(uint32_t sinceSeq)
+{
+    WaveletDrain out;
+    out.dropped = 0;
+    out.K = out.nscales = out.nOct = out.nVoc = 0;
+
+    std::lock_guard<std::mutex> lk(waveletRingMu);
+    out.K       = waveletK_;
+    out.nscales = waveletNscales_;
+    out.nOct    = waveletNOct_;
+    out.nVoc    = waveletNVoc_;
+    out.dropped = waveletDroppedTotal;
+
+    // sinceSeq == sentinel means "give me everything in the ring".
+    bool wantAll = (sinceSeq == 0xFFFFFFFFu);
+    auto it = waveletRing.begin();
+    if (!wantAll) {
+        for (; it != waveletRing.end(); ++it) {
+            // Modulo-aware "is it->seq after sinceSeq" for the 30-bit counter.
+            uint32_t diff = (it->seq - sinceSeq) & 0x3FFFFFFFu;
+            if (diff != 0 && diff < 0x20000000u) break;
+        }
+    }
+    out.columns.assign(it, waveletRing.end());
+    return out;
 }
 
 bool IntanSocket::updateBuffer()

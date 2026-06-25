@@ -191,6 +191,7 @@ public:
         , tcpSocket_(INVALID_SOCKET)
         , udpSocket_(INVALID_SOCKET)
         , lfpSocket_(INVALID_SOCKET)
+        , waveletSocket_(INVALID_SOCKET)
         , running_(false)
         , connected_(false)
         , currentChannelEnable_(0x0F)
@@ -221,12 +222,14 @@ public:
         // Auto-configure UDP destination
         autoConfigureUdp();
         
-        // Start UDP listener threads (broadband on udpPort_, LFP on fixed 5001).
-        // Both bind unconditionally: the LFP listener silently consumes nothing
-        // until the firmware's LFP engine is enabled.
+        // Start UDP listener threads (broadband on udpPort_, LFP on fixed 5001,
+        // wavelet scalogram on fixed 5004). All bind unconditionally: the LFP +
+        // wavelet listeners silently consume nothing until their firmware
+        // engines are enabled.
         running_ = true;
-        udpThread_ = std::thread(&Impl::udpListenerThread, this);
-        lfpThread_ = std::thread(&Impl::lfpListenerThread, this);
+        udpThread_     = std::thread(&Impl::udpListenerThread, this);
+        lfpThread_     = std::thread(&Impl::lfpListenerThread, this);
+        waveletThread_ = std::thread(&Impl::waveletListenerThread, this);
         
         // Give the listener a moment to bind so the device's reply about
         // udp_dest reflects post-autoConfigureUdp state.
@@ -261,6 +264,9 @@ public:
         if (lfpThread_.joinable()) {
             lfpThread_.join();
         }
+        if (waveletThread_.joinable()) {
+            waveletThread_.join();
+        }
 
         if (tcpSocket_ != INVALID_SOCKET) {
             closesocket(tcpSocket_);
@@ -276,7 +282,12 @@ public:
             closesocket(lfpSocket_);
             lfpSocket_ = INVALID_SOCKET;
         }
-        
+
+        if (waveletSocket_ != INVALID_SOCKET) {
+            closesocket(waveletSocket_);
+            waveletSocket_ = INVALID_SOCKET;
+        }
+
 #ifdef _WIN32
         WSACleanup();
 #endif
@@ -640,6 +651,11 @@ public:
     void setLfpDataCallback(LfpDataCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         lfpDataCallback_ = callback;
+    }
+
+    void setWaveletDataCallback(WaveletDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        waveletDataCallback_ = callback;
     }
 
     void setErrorCallback(ErrorCallback callback) {
@@ -1152,7 +1168,135 @@ public:
         }
         if (cb) cb(frame);
     }
-    
+
+    // ----------------------------------------------------------------------
+    // Wavelet (DWT) scalogram UDP listener -- fixed port 5004 per the firmware
+    // protocol (mirror remote/net.py::receive_wavelet). ONE datagram per
+    // scalogram column. Wire format (32-bit LE words):
+    //   word 0-1 : magic {0x5CA70900 ("SCALOG"), 0xCAFEBABE}
+    //   word 2-3 : 64-bit timestamp (w2 == frame seq, w3 = 0 / ts high)
+    //   word 4   : [7:0] n_octaves | [15:8] n_voices | [23:16] K | [24] overrun
+    //   word 5   : 32-bit frame sequence (mod 2^30, == word 2)
+    //   word 6   : [15:0] nscales (= n_octaves*n_voices) | [31:16] n_taps
+    //   word 7   : gain word
+    //   word 8+  : per lane (lane-major), nscales complex INT32 (re, im).
+    //              scale s = octave*n_voices + voice ; magnitude = |re+i*im|.
+    static constexpr uint32_t WAV_MAGIC_LOW     = 0x5CA70900;
+    static constexpr uint32_t WAV_MAGIC_HIGH    = 0xCAFEBABE;
+    static constexpr uint16_t WAV_UDP_PORT_DEF  = 5004;
+    static constexpr size_t   WAV_HEADER_BYTES  = 32;   // 8 words
+
+    void waveletListenerThread() {
+        waveletSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (waveletSocket_ == INVALID_SOCKET) {
+            std::cout << "[IntanInterface] Wavelet listener: socket() failed" << std::endl;
+            return;
+        }
+
+        int reuse = 1;
+        setsockopt(waveletSocket_, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#ifdef SO_REUSEPORT
+        setsockopt(waveletSocket_, SOL_SOCKET, SO_REUSEPORT,
+                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
+#endif
+        // Headroom for bursts: K=32, nscales=32 -> 32*32*2*4 = 8192 B payload.
+        int rcvbuf = 4 * 1024 * 1024;
+        setsockopt(waveletSocket_, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<char*>(&rcvbuf), sizeof(rcvbuf));
+
+        struct sockaddr_in bindAddr;
+        std::memset(&bindAddr, 0, sizeof(bindAddr));
+        bindAddr.sin_family = AF_INET;
+        bindAddr.sin_addr.s_addr = INADDR_ANY;
+        bindAddr.sin_port = htons(WAV_UDP_PORT_DEF);
+
+        if (bind(waveletSocket_, reinterpret_cast<struct sockaddr*>(&bindAddr),
+                sizeof(bindAddr)) == SOCKET_ERROR) {
+            std::cout << "[IntanInterface] Wavelet listener: bind to port "
+                      << WAV_UDP_PORT_DEF << " FAILED (errno="
+                      << errno << ")" << std::endl;
+            closesocket(waveletSocket_);
+            waveletSocket_ = INVALID_SOCKET;
+            return;
+        }
+
+        std::cout << "[IntanInterface] Wavelet listener: bound on port "
+                  << WAV_UDP_PORT_DEF << std::endl;
+
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(waveletSocket_, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<char*>(&tv), sizeof(tv));
+
+        // 65535 = max UDP datagram. Plenty for K*nscales*2 int32 + header.
+        std::vector<uint8_t> buffer(65535);
+
+        while (running_.load()) {
+            struct sockaddr_in senderAddr;
+            socklen_t senderLen = sizeof(senderAddr);
+            int received = recvfrom(waveletSocket_, reinterpret_cast<char*>(buffer.data()),
+                                    buffer.size(), 0,
+                                    reinterpret_cast<struct sockaddr*>(&senderAddr),
+                                    &senderLen);
+            if (received > 0) {
+                processWaveletDatagram(buffer.data(), received);
+            }
+        }
+    }
+
+    void processWaveletDatagram(const uint8_t* data, size_t len) {
+        if (len < WAV_HEADER_BYTES) return;
+
+        uint32_t magicLo = unpackU32LE(data);
+        uint32_t magicHi = unpackU32LE(data + 4);
+        if (magicLo != WAV_MAGIC_LOW || magicHi != WAV_MAGIC_HIGH) return;
+
+        uint64_t timestamp = (uint64_t)unpackU32LE(data + 8) |
+                             ((uint64_t)unpackU32LE(data + 12) << 32);
+        uint32_t w4   = unpackU32LE(data + 16);
+        uint32_t seq  = unpackU32LE(data + 20);
+        uint32_t w6   = unpackU32LE(data + 24);
+        uint32_t gain = unpackU32LE(data + 28);
+
+        uint8_t  nOct     = (uint8_t)(w4 & 0xFF);
+        uint8_t  nVoc     = (uint8_t)((w4 >> 8) & 0xFF);
+        uint8_t  K        = (uint8_t)((w4 >> 16) & 0xFF);
+        bool     overrun  = ((w4 >> 24) & 0x1) != 0;
+        uint16_t nscales  = (uint16_t)(w6 & 0xFFFF);
+        uint16_t nTaps    = (uint16_t)((w6 >> 16) & 0xFFFF);
+        if (K == 0 || nscales == 0) return;
+
+        // Payload: K * nscales complex int32 (re, im), lane-major.
+        size_t expectedInts  = (size_t)K * (size_t)nscales * 2;
+        size_t expectedBytes = expectedInts * sizeof(int32_t);
+        size_t available     = len - WAV_HEADER_BYTES;
+        if (available < expectedBytes) return;     // truncated / wrong cfg
+
+        const int32_t* samples = reinterpret_cast<const int32_t*>(data + WAV_HEADER_BYTES);
+
+        WaveletFrame frame;
+        frame.timestamp     = timestamp;
+        frame.frameSequence = seq;
+        frame.nOctaves      = nOct;
+        frame.nVoices       = nVoc;
+        frame.K             = K;
+        frame.nscales       = nscales;
+        frame.nTaps         = nTaps;
+        frame.gain          = gain;
+        frame.overrun       = overrun;
+        frame.samples       = samples;
+        frame.sampleCount   = expectedInts;
+
+        WaveletDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = waveletDataCallback_;
+        }
+        if (cb) cb(frame);
+    }
+
     void processUdpData(const uint8_t* data, size_t len) {
         size_t expectedBytes = expectedPacketSizeWords_ * 4;
         
@@ -1502,10 +1646,12 @@ public:
     SOCKET tcpSocket_;
     SOCKET udpSocket_;
     SOCKET lfpSocket_;
-    
+    SOCKET waveletSocket_;
+
     // Threading
     std::thread udpThread_;
     std::thread lfpThread_;
+    std::thread waveletThread_;
     std::atomic<bool> running_;
     std::atomic<bool> connected_;
     mutable std::mutex tcpMutex_;
@@ -1530,6 +1676,7 @@ public:
     // Callbacks
     DataCallback dataCallback_;
     LfpDataCallback lfpDataCallback_;
+    WaveletDataCallback waveletDataCallback_;
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -1713,6 +1860,10 @@ void IntanInterface::setDataCallback(DataCallback callback) {
 
 void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
     pImpl_->setLfpDataCallback(callback);
+}
+
+void IntanInterface::setWaveletDataCallback(WaveletDataCallback callback) {
+    pImpl_->setWaveletDataCallback(callback);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {

@@ -169,7 +169,7 @@ void BandwidthInterface::paint(Graphics& g)
 // ============================================================================
 
 IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* socket)
-    : GenericEditor(parentNode)
+    : VisualizerEditor(parentNode, "DWT", 425)
 {
     node = socket;
     desiredWidth = 425;
@@ -574,6 +574,13 @@ void IntanSocketEditor::updateChipDetection(const IntanInterface::AutoDetectionR
     portAInterface->updateCipo1Status(result.cipo1Detected, result.cipo1ChipType);
     portBInterface->updateCipo0Status(result.portBCipo0Detected, result.portBCipo0ChipType);
     portBInterface->updateCipo1Status(result.portBCipo1Detected, result.portBCipo1ChipType);
+}
+
+Visualizer* IntanSocketEditor::createNewCanvas()
+{
+    // The Visualizer base takes a GenericProcessor*; we additionally pass the
+    // IntanSocket pointer so the canvas can drain the wavelet ring directly.
+    return new DwtCanvas(getProcessor(), node);
 }
 
 void IntanSocketEditor::syncFromDeviceState(uint8_t mask, bool debugOn)
