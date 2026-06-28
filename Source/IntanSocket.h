@@ -139,8 +139,8 @@ public:
     bool setAuxSequencerMode(bool enable);
     bool isAuxSequencerMode() const { return auxSeqMode; }
 
-    /** Enable / disable the firmware's LFP/DSP engine + the second
-        UDP stream (port 5001). When enabling and the firmware has no
+    /** Enable / disable the firmware's LFP/DSP engine. LFP frames arrive on the
+        SAME unified UDP port as broadband (stream_type=2). When enabling and the firmware has no
         configuration yet (lane_mask = 0 or decim_R = 0), this first
         applies a default configure -- same values as remote/net.py's
         configure_lfp(): 0x0F lane mask, decim 15 (2 kHz output), 128-tap

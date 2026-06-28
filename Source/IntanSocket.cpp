@@ -705,11 +705,17 @@ bool IntanSocket::updateBuffer()
         dataQueue.pop();
     }
 
+    // UNIFIED broadband header: 8-word common header + 6-word sub-block = 14
+    // header words ahead of the data (docs/unified-packet-format.md). Timestamp
+    // is the common header's w2/w3 (unchanged offset).
+    static constexpr size_t kBroadbandHeaderWords = 14;
+
     int64 timestamp = (static_cast<uint64_t>(packet.data.data()[3]) << 32) | packet.data.data()[2];
 
-    // Skip header (first 10 words: magic + timestamp)
-    const uint32_t* dataWords = packet.data.data() + 10;
-    size_t numDataWords = packet.data.size() - 10;
+    // Skip the full 14-word unified broadband header; the data words that
+    // follow are byte-identical to the legacy stream.
+    const uint32_t* dataWords = packet.data.data() + kBroadbandHeaderWords;
+    size_t numDataWords = packet.data.size() - kBroadbandHeaderWords;
 
     // (Per-second PACKET DEBUG dump removed -- it was log spam; totalSamples
     // is still incremented at the end of this function as a sample counter,
@@ -829,11 +835,17 @@ bool IntanSocket::updateBuffer()
     //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's
     //    housekeeping result -- neither is accelerometer data in this mode.)
     //
-    // Port B uses the SAME header echo (words 4/5) as port A.
+    // UNIFIED header field mapping (docs/unified-packet-format.md, net.py
+    // print_aux_info):
+    //   AUX1 = common-header word 6 = {echo0[31:16], aux_flags[15:8], digital_in[7:0]}
+    //   sub-block word 8           = {echo_slot2_prev[31:16], echo_slot1_prev[15:0]}
+    // The slot-1 accelerometer command echo that drives the de-interleave is in
+    // the LOW 16 bits of word 8 (was word 5 in the legacy 10-word header).
+    // Port B uses the SAME header echo as port A.
     {
-        uint32_t hdr4 = packet.data.data()[4];
-        uint32_t hdr5 = packet.data.data()[5];
-        uint8_t auxFlags = (hdr4 >> 8) & 0xFF;
+        uint32_t auxWord  = packet.data.data()[6];   // AUX1 (flags + digital_in + echo0)
+        uint32_t echoWord = packet.data.data()[8];   // sub-block: prev slot-1/2 echoes
+        uint8_t auxFlags = (auxWord >> 8) & 0xFF;
         bool seqActive = (auxFlags & 0x01) != 0;
         bool echoValid = (auxFlags & 0x10) != 0;
 
@@ -863,7 +875,7 @@ bool IntanSocket::updateBuffer()
         }
         else
         {
-            uint16_t echo1 = hdr5 & 0xFFFF;          // slot-1 cmd answered @ cycle 0
+            uint16_t echo1 = echoWord & 0xFFFF;      // slot-1 cmd answered @ cycle 0
             bool isConvert = (echo1 & 0xC000) == 0;
             int convCh = (echo1 >> 8) & 0x3F;
 
@@ -887,8 +899,8 @@ bool IntanSocket::updateBuffer()
     for (; outCh < num_channels; ++outCh)
         convbuf[outCh] = 0.0f;
     
-    uint64 ttlEventWord = (static_cast<uint64_t>(packet.data.data()[5]) << 32) | packet.data.data()[4];
-    ttlEventWord = ttlEventWord & 0x00000000000000FF; // digital input is least significant 8 bits
+    // digital_in[7:0] now lives in the LOW byte of AUX1 (common header word 6).
+    uint64 ttlEventWord = packet.data.data()[6] & 0xFFu; // digital input = low 8 bits of AUX1
 
 
     double ts;

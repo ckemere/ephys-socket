@@ -135,8 +135,8 @@ public:
         uint8_t rhdReg[22];
 
         // LFP/DSP engine config + status (firmware 0e99881+, status == 160).
-        // The engine emits a SEPARATE UDP stream on port 5001 (broadband on
-        // 5000 is untouched). Decimated samples = popcount(lane_mask) x 32
+        // The engine emits LFP frames on the UNIFIED UDP port (default 5000),
+        // tagged stream_type = 2. Decimated samples = popcount(lane_mask) x 32
         // amplifier channels per frame, at 30000/decim_R Hz. Configure with
         // CMD_LFP_SET_CHANNELS / CMD_LFP_SET_PARAMS / CMD_LFP_WRITE_COEF,
         // then CMD_LFP_ENABLE 1. hasLfpStatus is false on older firmware.
@@ -257,11 +257,12 @@ public:
     using DataCallback = std::function<void(const uint32_t* data, size_t wordCount, uint64_t timestamp)>;
 
     /**
-     * @brief LFP frame metadata (decoded once per UDP packet on port 5001).
+     * @brief LFP frame metadata (decoded once per LFP datagram on the UNIFIED
+     * UDP port, demuxed by stream_type = 2; see docs/unified-packet-format.md).
      */
     struct LfpFrame {
-        uint64_t timestamp;        // frame_seq * decim_R (aligns with broadband ts)
-        uint32_t frameSequence;    // monotonic LFP frame counter (for drop detection)
+        uint64_t timestamp;        // master ts of the newest input sample of the window
+        uint32_t frameSequence;    // per-stream LFP SEQ (header w4; for drop detection)
         uint8_t  laneMask;         // streams whose 32 amp channels are in this frame
         uint8_t  decimR;
         uint8_t  numTaps;
@@ -272,8 +273,8 @@ public:
     };
 
     /**
-     * @brief Callback type for receiving an LFP frame (UDP port 5001).
-     * Invoked from the LFP listener thread.
+     * @brief Callback type for receiving an LFP frame (UNIFIED UDP port,
+     * stream_type = 2). Invoked from the demux thread.
      */
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
 
@@ -609,12 +610,13 @@ public:
     bool readRegister(uint8_t reg, uint16_t& cipo0Value, uint16_t& cipo1Value);
 
     // ========================================================================
-    // LFP / DSP ENGINE (firmware >= 1.2; second UDP stream on port 5001)
+    // LFP / DSP ENGINE (firmware >= 1.2; UNIFIED port, stream_type = 2)
     // ========================================================================
     //
     // The engine LP-filters and decimates the amplifier streams (the same 8
-    // bit lanes as the broadband stream), emitting a parallel UDP datagram
-    // per output frame on port 5001 -- broadband on 5000 is untouched.
+    // bit lanes as the broadband stream), emitting a parallel UDP datagram per
+    // output frame on the SAME port as broadband (default 5000), tagged
+    // stream_type = 2 in the common header and demuxed host-side.
     //
     // Configure order: lfpEnable(false) -> lfpSetChannels(mask)
     //   -> lfpSetParams(decim_R, num_taps) -> lfpUploadCoefs(coefs)
@@ -670,9 +672,9 @@ public:
     void setDataCallback(DataCallback callback);
 
     /**
-     * @brief Register callback for LFP frames (UDP port 5001).
+     * @brief Register callback for LFP frames (UNIFIED port, stream_type = 2).
      *
-     * Invoked from the LFP listener thread for every well-formed frame.
+     * Invoked from the demux thread for every well-formed frame.
      * The pointer / count in LfpFrame are valid only for the duration of
      * the callback; copy what you need.
      */
@@ -694,9 +696,9 @@ public:
     /**
      * @brief Get the expected packet size in words
      * 
-     * Packet size depends on channel enable setting:
-     * - Header: 10 words (magic + timestamp + digital + 2x analog)
-     * - Data: variable based on enabled channels
+     * Packet size depends on channel enable setting (UNIFIED broadband format):
+     * - Header: 14 words (8-word common header + 6-word broadband sub-block)
+     * - Data: variable based on enabled channels (byte-identical to legacy)
      * 
      * @param channelMask Channel enable mask (0x0-0xF)
      * @return Expected packet size in 32-bit words
