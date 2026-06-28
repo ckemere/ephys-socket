@@ -169,7 +169,7 @@ void BandwidthInterface::paint(Graphics& g)
 // ============================================================================
 
 IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* socket)
-    : GenericEditor(parentNode)
+    : VisualizerEditor(parentNode, "DWT", 425)
 {
     node = socket;
     desiredWidth = 425;
@@ -340,6 +340,15 @@ void IntanSocketEditor::stopAcquisition()
     debugMode1PButton->setEnabledState(true);
     debugMode2PButton->setEnabledState(true);
     lfpEnableButton->setEnabledState(true);
+}
+
+Visualizer* IntanSocketEditor::createNewCanvas()
+{
+    // The Visualizer base takes a GenericProcessor*; we additionally pass the
+    // IntanSocket pointer so the WAVELET canvas can drain the reassembled
+    // scalogram surface directly. The canvas is purely a consumer -- it never
+    // touches the broadband/LFP data path.
+    return new DwtCanvas(getProcessor(), node);
 }
 
 void IntanSocketEditor::buttonClicked(Button* button)

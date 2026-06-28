@@ -693,6 +693,11 @@ public:
         lfpDataCallback_ = callback;
     }
 
+    void setWaveletDataCallback(WaveletDataCallback callback) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        waveletDataCallback_ = callback;
+    }
+
     void setErrorCallback(ErrorCallback callback) {
         std::lock_guard<std::mutex> lock(callbackMutex_);
         errorCallback_ = callback;
@@ -1171,9 +1176,10 @@ public:
             processBroadbandDatagram(data, len);
         } else if (streamType == STREAM_TYPE_LFP) {
             processLfpDatagram(data, len);
+        } else if (streamType == STREAM_TYPE_WAVELET) {
+            processWaveletDatagram(data, len);
         }
-        // Other stream types (e.g. WAVELET=3) are silently ignored on this
-        // branch -- they belong to the follow-on consumer.
+        // Any other stream type is silently ignored (forward-compat).
     }
 
     // LFP frame (UNIFIED stream_type = 2). The PL builds the whole wire packet
@@ -1252,6 +1258,93 @@ public:
             cb = lfpDataCallback_;
         }
         if (cb) cb(frame);
+    }
+
+    // WAVELET octave packet (UNIFIED stream_type = 3). ONE packet = ONE octave,
+    // emitted rate-aligned (octave o updates at 3 kHz / 2^o). We decode the
+    // header byte-for-byte the way remote/net.py's UnifiedSink._handle_wavelet /
+    // receive_wavelet do, verify PER-OCTAVE SEQ continuity (each octave has its
+    // OWN SEQ because it updates at its own rate -- so we track a last-seq per
+    // octave and flag any gap as [LOSS]), and hand the octave block to the
+    // consumer, which holds it between updates to reassemble the full surface.
+    //   w4 = SEQ (per-octave) | w5 = AUX0 (octave|n_oct<<4|n_voc<<8|overrun<<24)
+    //   w6 = AUX1 (n_channels|lane_start<<8)
+    //   w8.. = n_channels*n_voices complex (re,im int32), lane-major/voice-minor.
+    void processWaveletDatagram(const uint8_t* data, size_t len) {
+        static constexpr size_t HDR = COMMON_HEADER_WORDS * 4;  // 32-byte common header
+        if (len < HDR) return;
+
+        uint64_t timestamp = (uint64_t)unpackU32LE(data + 8) |
+                             ((uint64_t)unpackU32LE(data + 12) << 32);   // w2/w3
+        uint32_t seq  = unpackU32LE(data + 16);   // w4 = per-octave SEQ
+        uint32_t aux0 = unpackU32LE(data + 20);   // w5 = AUX0
+        uint32_t aux1 = unpackU32LE(data + 24);   // w6 = AUX1
+
+        uint8_t  octave    = (uint8_t)(aux0 & 0xF);
+        uint8_t  nOctaves  = (uint8_t)((aux0 >> 4) & 0xF);
+        uint8_t  nVoices   = (uint8_t)((aux0 >> 8) & 0xF);
+        bool     overrun   = ((aux0 >> 24) & 0x1) != 0;
+        uint8_t  nChannels = (uint8_t)(aux1 & 0xFF);
+        uint16_t laneStart = (uint16_t)((aux1 >> 8) & 0xFFFF);
+
+        // Payload size from the header: n_channels * n_voices complex (re,im)
+        // int32. Cross-check the datagram is long enough (mirrors net.py's
+        // "nints != n_chan*n_voc*2" guard) before we read the bins.
+        size_t binsInt32  = (size_t)nChannels * (size_t)nVoices * 2;  // re,im
+        size_t bytesNeed  = binsInt32 * sizeof(int32_t);
+        if (nVoices == 0 || len - HDR < bytesNeed)
+            return;                                    // truncated / wrong cfg -- drop
+
+        // PER-OCTAVE SEQ continuity = the wavelet loss check. Each octave streams
+        // at its own rate, so its SEQ advances independently; compare against the
+        // last SEQ seen FOR THIS OCTAVE. A gap means the board emitted octave
+        // packets we never received -- log it loudly (never hide loss). Matches
+        // net.py UnifiedSink._handle_wavelet (self._wav_last_seq[octave]).
+        {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            if (octave < kMaxWaveletOctaves) {
+                if (wavHaveSeq_[octave]) {
+                    uint32_t expectedSeq = wavLastSeq_[octave] + 1;  // wraps mod 2^32
+                    if (seq != expectedSeq) {
+                        uint32_t missing = seq - expectedSeq;  // mod 2^32
+                        wavSeqGaps_++;
+                        wavLostPackets_ += missing;
+                        std::cout << "[IntanInterface][LOSS] Wavelet oct" << (int)octave
+                                  << " SEQ gap: expected " << expectedSeq << ", got " << seq
+                                  << " (+" << missing << " missing). wav_seq_gaps="
+                                  << wavSeqGaps_ << std::endl;
+                    }
+                }
+                wavLastSeq_[octave] = seq;
+                wavHaveSeq_[octave] = true;
+            }
+            wavPackets_++;
+        }
+
+        // The payload is little-endian int32, naturally aligned (the common
+        // header is a whole number of 32-bit words). On our LE platforms the
+        // reinterpret_cast is safe; unpackU32LE-equivalence is asserted by the
+        // standalone parser test against the net.py reference.
+        const int32_t* bins = reinterpret_cast<const int32_t*>(data + HDR);
+
+        WaveletPacket pkt;
+        pkt.timestamp = timestamp;
+        pkt.sequence  = seq;
+        pkt.octave    = octave;
+        pkt.nOctaves  = nOctaves;
+        pkt.nVoices   = nVoices;
+        pkt.overrun   = overrun;
+        pkt.nChannels = nChannels;
+        pkt.laneStart = laneStart;
+        pkt.bins      = bins;
+        pkt.binCount  = binsInt32;
+
+        WaveletDataCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(callbackMutex_);
+            cb = waveletDataCallback_;
+        }
+        if (cb) cb(pkt);
     }
 
     // A datagram is exactly one broadband packet (the board sends one packet
@@ -1672,10 +1765,22 @@ public:
     uint32_t lfpLastSeq_     = 0;
     uint64_t lfpSeqGaps_     = 0;   // LFP gap events
     uint64_t lfpLostFrames_  = 0;   // total LFP frames implied missing
-    
+
+    // Per-OCTAVE wavelet SEQ loss tracking. Each octave streams at its own rate
+    // (octave o at 3 kHz / 2^o), so each octave carries its OWN monotonic SEQ;
+    // we track a last-seq per octave and flag any gap as [LOSS]. (Mirrors net.py
+    // UnifiedSink._wav_last_seq[octave].) AUX0[3:0] is 4 bits -> 16 octaves max.
+    static constexpr int kMaxWaveletOctaves = 16;
+    bool     wavHaveSeq_[kMaxWaveletOctaves] = { false };
+    uint32_t wavLastSeq_[kMaxWaveletOctaves] = { 0 };
+    uint64_t wavSeqGaps_    = 0;   // wavelet gap events (summed over octaves)
+    uint64_t wavLostPackets_ = 0;  // total wavelet octave packets implied missing
+    uint64_t wavPackets_    = 0;   // total wavelet octave packets received
+
     // Callbacks
     DataCallback dataCallback_;
     LfpDataCallback lfpDataCallback_;
+    WaveletDataCallback waveletDataCallback_;
     ErrorCallback errorCallback_;
     
     // Auto-detection
@@ -1859,6 +1964,10 @@ void IntanInterface::setDataCallback(DataCallback callback) {
 
 void IntanInterface::setLfpDataCallback(LfpDataCallback callback) {
     pImpl_->setLfpDataCallback(callback);
+}
+
+void IntanInterface::setWaveletDataCallback(WaveletDataCallback callback) {
+    pImpl_->setWaveletDataCallback(callback);
 }
 
 void IntanInterface::setErrorCallback(ErrorCallback callback) {

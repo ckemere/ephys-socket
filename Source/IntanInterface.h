@@ -279,6 +279,52 @@ public:
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
 
     /**
+     * @brief One WAVELET scalogram packet (UNIFIED UDP port, stream_type = 3).
+     *
+     * ONE packet = ONE octave, emitted rate-aligned (octave o updates at
+     * 3 kHz / 2^o). The host REASSEMBLES the full scalogram surface by holding
+     * each octave's last value between its (rate-aligned) updates -- a multirate
+     * surface. Decoded byte-for-byte the way remote/net.py's UnifiedSink /
+     * receive_wavelet do (docs/unified-packet-format.md, WAVELET section):
+     *
+     *   w0 MAGIC = 0xCAFEBABE
+     *   w1 TYPE_VER = stream_type=3 | version<<8 | flags<<16
+     *   w2/w3 = 64-bit master timestamp
+     *   w4 = SEQ  (PER-OCTAVE; +1 per packet OF THIS OCTAVE -- the loss check)
+     *   w5 = AUX0 = octave[3:0] | n_octaves[7:4] | n_voices[11:8] | overrun[24]
+     *   w6 = AUX1 = n_channels[7:0] | lane_start[23:8]
+     *   w7 = RSVD
+     *   w8.. = n_channels * n_voices complex bins (re,im int32 each),
+     *          lane-major then voice-minor, FOR THIS OCTAVE ONLY:
+     *            [(ch0,v0.re),(ch0,v0.im),(ch0,v1.re),(ch0,v1.im)...,(ch1,v0.re)...]
+     *
+     * Bin (local channel c in [0,nChannels), voice v in [0,nVoices)):
+     *   re = bins[(c * nVoices + v) * 2 + 0]
+     *   im = bins[(c * nVoices + v) * 2 + 1]
+     * The absolute scalogram lane is (laneStart + c); the absolute scale row is
+     * (octave * nVoices + v).
+     */
+    struct WaveletPacket {
+        uint64_t       timestamp;     // master ts (w2/w3)
+        uint32_t       sequence;      // per-OCTAVE SEQ (w4)
+        uint8_t        octave;        // this packet's octave (AUX0[3:0])
+        uint8_t        nOctaves;      // total octaves (AUX0[7:4])
+        uint8_t        nVoices;       // voices/octave (AUX0[11:8])
+        bool           overrun;       // sticky compute-overrun flag (AUX0[24])
+        uint8_t        nChannels;     // lanes in THIS packet (AUX1[7:0])
+        uint16_t       laneStart;     // first absolute lane index (AUX1[23:8])
+        const int32_t* bins;          // nChannels*nVoices complex (re,im) int32
+        size_t         binCount;      // == nChannels * nVoices * 2 (int32 count)
+    };
+
+    /**
+     * @brief Callback type for receiving one WAVELET octave packet (UNIFIED UDP
+     * port, stream_type = 3). Invoked from the demux thread. The bins pointer is
+     * valid only for the duration of the callback; copy what you keep.
+     */
+    using WaveletDataCallback = std::function<void(const WaveletPacket&)>;
+
+    /**
      * @brief Callback type for error notifications
      *
      * @param errorMessage Human-readable error description
@@ -679,6 +725,18 @@ public:
      * the callback; copy what you need.
      */
     void setLfpDataCallback(LfpDataCallback callback);
+
+    /**
+     * @brief Register callback for WAVELET octave packets (UNIFIED port,
+     * stream_type = 3).
+     *
+     * Invoked from the demux thread for every well-formed octave packet (ONE
+     * octave per call, rate-aligned). The bins pointer in WaveletPacket is valid
+     * only for the duration of the callback; copy what you need. The consumer is
+     * responsible for holding each octave between its updates to reassemble the
+     * full multirate scalogram surface.
+     */
+    void setWaveletDataCallback(WaveletDataCallback callback);
 
     /**
      * @brief Register callback for error notifications

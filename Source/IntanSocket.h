@@ -6,6 +6,9 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <deque>
+#include <vector>
+#include <atomic>
 
 namespace IntanSocketNode
 {
@@ -156,6 +159,51 @@ public:
         Used by setLfpEnabled(true) when the firmware is fresh. */
     bool configureLfpDefaults();
 
+    // ------------------------------------------------------------------
+    // WAVELET (DWT) scalogram consumer API (used by the DwtCanvas viewer).
+    //
+    // The wavelet engine (mz-unified-wavelet firmware) emits ONE UNIFIED
+    // datagram PER OCTAVE, rate-aligned: octave o updates at 3 kHz / 2^o
+    // (octave 0 at 3 kHz, the slowest at ~23 Hz). IntanInterface decodes each
+    // octave packet (stream_type=3) and calls processWaveletPacket(), which
+    // places that octave's block into a HELD multirate surface (each octave is
+    // held at its last value between its updates -- the truthful multirate
+    // scalogram) and, on each octave-0 (fastest) update, parks a synthesized
+    // full COLUMN (all K lanes x nscales, where nscales = n_octaves*n_voices)
+    // into waveletRing for the canvas. The canvas polls drainWaveletSince().
+    //
+    // This consumer is OPTIONAL and self-contained: it never touches the
+    // broadband or LFP data path, so it cannot regress those streams. It
+    // does nothing until the firmware's wavelet engine is enabled (configured
+    // out of band via remote/net.py configure_wavelet + wavelet_enable).
+    // ------------------------------------------------------------------
+
+    /** One reassembled scalogram column: all K lanes x nscales magnitudes (the
+        held multirate surface sampled at one time step). Lane-major: lane L,
+        scale s (s = octave*n_voices + voice; bin 0 = highest freq) lives at
+        mags[L * nscales + s]. */
+    struct WaveletColumn {
+        uint32_t seq;                  // octave-0 SEQ at synthesis time (monotone)
+        uint64_t timestamp;
+        std::vector<float> mags;       // K * nscales magnitudes (sqrt(re^2+im^2))
+    };
+
+    /** Snapshot of all wavelet columns newer than the caller's last-seen seq.
+        The caller sets `sinceSeq`; we return columns with seq != that and the
+        current surface geometry so the canvas can size its image / axes. */
+    struct WaveletDrain {
+        std::vector<WaveletColumn> columns;
+        int K = 0;           // streamed lanes
+        int nscales = 0;     // n_octaves * n_voices
+        int nOct = 0;
+        int nVoc = 0;
+        uint64_t dropped = 0;  // ring overflow (host-side) since session start
+    };
+    WaveletDrain drainWaveletSince(uint32_t sinceSeq);
+
+    /** Whether wavelet octave packets have been arriving this session. */
+    bool isWaveletRunning() const { return waveletColumnsReceived.load() > 0; }
+
 private:
     const int bufferSizeInSeconds = 10;
     
@@ -177,6 +225,12 @@ private:
         sourceBuffers[1]. Each frame is one decimated sample per channel
         across `popcount(lane_mask) * 32` LFP channels. */
     void processLfpFrame(const IntanInterface::LfpFrame& frame);
+
+    /** Place ONE wavelet octave packet (from the IntanInterface wavelet
+        listener) into the held multirate surface; on each octave-0 update,
+        synthesize and park a full scalogram column for the canvas. Runs on the
+        demux thread -- kept cheap, and entirely off the broadband/LFP path. */
+    void processWaveletPacket(const IntanInterface::WaveletPacket& pkt);
 
     /** Number of enabled 16-bit data streams in the 8-bit mask.
         Bits 0-3 = port A (A_CIPO0_REG, A_CIPO0_DDR, A_CIPO1_REG, A_CIPO1_DDR);
@@ -245,6 +299,27 @@ private:
                                 {0x8000, 0x8000, 0x8000},
                                 {0x8000, 0x8000, 0x8000},
                                 {0x8000, 0x8000, 0x8000}};
+
+    // ------------------------------------------------------------------
+    // WAVELET held multirate surface + canvas ring (off the broadband/LFP path).
+    //   waveletSurface_[octave] holds that octave's last block of magnitudes,
+    //   K lanes x n_voices each (sqrt(re^2+im^2)), held between octave updates.
+    //   On each octave-0 update we flatten the whole surface into a full column
+    //   (K x nscales) and push it into waveletRing for the canvas.
+    // Producer = demux thread (processWaveletPacket); consumer = visualizer
+    // thread (drainWaveletSince). Guarded by waveletMu_.
+    // ------------------------------------------------------------------
+    static constexpr int kWaveletMaxOctaves = 16;
+    static constexpr size_t kWaveletRingCapacity = 4096;  // ~1.4 s at 3 kHz oct0
+    mutable std::mutex waveletMu_;
+    // per-octave held magnitudes: [octave] -> K*n_voices magnitudes (lane-major)
+    std::vector<float> waveletHeld_[kWaveletMaxOctaves];
+    std::deque<WaveletColumn> waveletRing_;
+    int      waveletK_     = 0;     // streamed lanes (from the latest packet)
+    int      waveletNOct_  = 0;     // n_octaves (full surface height = nOct*nVoc)
+    int      waveletNVoc_  = 0;     // n_voices
+    uint64_t waveletDroppedTotal_ = 0;     // host-side ring overflow
+    std::atomic<uint64_t> waveletColumnsReceived{0};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(IntanSocket);
 };

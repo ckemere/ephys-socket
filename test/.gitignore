@@ -1,3 +1,6 @@
 unified_parse_test
 cpp_out.txt
 py_out.txt
+wavelet_parse_test
+cpp_wav_out.txt
+py_wav_out.txt

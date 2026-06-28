@@ -2,6 +2,7 @@
 #include "IntanSocketEditor.h"
 
 #include <sstream>
+#include <cmath>
 
 using namespace IntanSocketNode;
 
@@ -150,6 +151,17 @@ bool IntanSocket::connectDevice(bool printOutput)
         intanInterface->setLfpDataCallback(
             [this](const IntanInterface::LfpFrame& f) {
                 processLfpFrame(f);
+            }
+        );
+
+        // Wavelet (DWT) scalogram callback: ONE octave per datagram on the
+        // unified port (stream_type=3), rate-aligned. Always wired -- silently
+        // does nothing until the wavelet engine is enabled in the firmware
+        // (remote/net.py configure_wavelet + wavelet_enable). Feeds the held
+        // multirate surface + DwtCanvas; never touches broadband/LFP buffers.
+        intanInterface->setWaveletDataCallback(
+            [this](const IntanInterface::WaveletPacket& p) {
+                processWaveletPacket(p);
             }
         );
 
@@ -685,6 +697,111 @@ void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
                                   &lfpTimestamp,
                                   &eventState,
                                   1);  // ONE time sample
+}
+
+// ----------------------------------------------------------------------------
+// WAVELET scalogram reassembly. Called from the IntanInterface demux thread for
+// EACH octave packet (stream_type=3). ONE packet = ONE octave; we hold each
+// octave's last value between its (rate-aligned) updates -- the multirate
+// surface -- exactly as net.py's receive_wavelet does. On each octave-0 update
+// (the fastest band, 3 kHz) we flatten the held surface into a full column and
+// park it for the canvas. This path is entirely separate from the broadband and
+// LFP buffers, so it can never block or regress those streams.
+// ----------------------------------------------------------------------------
+void IntanSocket::processWaveletPacket(const IntanInterface::WaveletPacket& pkt)
+{
+    if (pkt.octave >= kWaveletMaxOctaves) return;     // 4-bit field -> 0..15
+    if (pkt.nVoices == 0 || pkt.nChannels == 0) return;
+
+    const int nVoc  = pkt.nVoices;
+    const int K     = pkt.nChannels;
+    const int nOct  = (pkt.nOctaves > 0) ? pkt.nOctaves : (pkt.octave + 1);
+    const int oct   = pkt.octave;
+
+    std::lock_guard<std::mutex> lk(waveletMu_);
+
+    // Geometry from the latest packet. If K / n_voices / n_octaves changed
+    // (reconfigure), reset the held surface so we never mix stale geometry.
+    if (K != waveletK_ || nVoc != waveletNVoc_ || nOct != waveletNOct_) {
+        for (int o = 0; o < kWaveletMaxOctaves; ++o) waveletHeld_[o].clear();
+        waveletRing_.clear();
+        waveletK_    = K;
+        waveletNVoc_ = nVoc;
+        waveletNOct_ = nOct;
+    }
+
+    // HOLD: store THIS octave's magnitudes (K lanes x nVoc voices, lane-major),
+    // converting the complex int32 bins to magnitude. Bin (local lane c, voice
+    // v): re = bins[(c*nVoc+v)*2+0], im = ...+1 (lane-major/voice-minor).
+    std::vector<float>& held = waveletHeld_[oct];
+    held.assign((size_t)K * nVoc, 0.0f);
+    for (int c = 0; c < K; ++c)
+        for (int v = 0; v < nVoc; ++v) {
+            size_t i = (size_t)(c * nVoc + v) * 2;
+            if (i + 1 >= pkt.binCount) break;
+            double re = (double)pkt.bins[i + 0];
+            double im = (double)pkt.bins[i + 1];
+            held[(size_t)c * nVoc + v] = (float)std::sqrt(re * re + im * im);
+        }
+
+    waveletColumnsReceived.fetch_add(1, std::memory_order_relaxed);
+
+    // Only synthesize a full column on the FASTEST octave's update (octave 0).
+    // Slower octaves just refresh their held block; their values appear in the
+    // next octave-0 column, held since their last update -- the truthful
+    // multirate representation (and ~one column per fast frame for the canvas).
+    if (oct != 0) return;
+
+    const int nscales = nOct * nVoc;     // full surface height (high f at top)
+    WaveletColumn col;
+    col.seq       = pkt.sequence;        // octave-0 SEQ -> monotone column id
+    col.timestamp = pkt.timestamp;
+    col.mags.assign((size_t)K * nscales, 0.0f);
+    // Flatten held surface: scale row s = o*nVoc + v; column index = L*nscales+s.
+    for (int o = 0; o < nOct; ++o) {
+        const std::vector<float>& blk = waveletHeld_[o];
+        if (blk.empty()) continue;        // octave not seen yet -> stays 0
+        for (int c = 0; c < K; ++c)
+            for (int v = 0; v < nVoc; ++v) {
+                size_t src = (size_t)c * nVoc + v;
+                if (src >= blk.size()) continue;
+                int s = o * nVoc + v;
+                col.mags[(size_t)c * nscales + s] = blk[src];
+            }
+    }
+
+    if (waveletRing_.size() >= kWaveletRingCapacity) {
+        waveletRing_.pop_front();
+        ++waveletDroppedTotal_;
+    }
+    waveletRing_.emplace_back(std::move(col));
+}
+
+IntanSocket::WaveletDrain IntanSocket::drainWaveletSince(uint32_t sinceSeq)
+{
+    WaveletDrain out;
+    std::lock_guard<std::mutex> lk(waveletMu_);
+    out.K       = waveletK_;
+    out.nOct    = waveletNOct_;
+    out.nVoc    = waveletNVoc_;
+    out.nscales = waveletNOct_ * waveletNVoc_;
+    out.dropped = waveletDroppedTotal_;
+    // Return columns newer than sinceSeq (the canvas remembers the last seq it
+    // rendered). The ring is in arrival order, so emit everything past the match;
+    // if we never find it (canvas just started, or ring wrapped), emit all.
+    bool emitting = (sinceSeq == 0xFFFFFFFFu);  // sentinel: canvas hasn't drawn yet
+    for (const auto& col : waveletRing_) {
+        if (!emitting) {
+            if (col.seq == sinceSeq) { emitting = true; }
+            continue;
+        }
+        out.columns.push_back(col);
+    }
+    if (!emitting) {
+        // sinceSeq not in the ring (wrapped past it) -> hand back the whole ring.
+        out.columns.assign(waveletRing_.begin(), waveletRing_.end());
+    }
+    return out;
 }
 
 bool IntanSocket::updateBuffer()
