@@ -75,11 +75,15 @@ namespace {
     //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
     //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
     //  160  bytes  + lfp engine config + status              -- 0e99881
-    // The buffer must be sized to the largest known form, or extra bytes will
-    // sit unread in the TCP queue and corrupt the next command's ACK. The
-    // parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and decodes
-    // optional fields based on what the device actually sent.
-    constexpr size_t STATUS_RESPONSE_SIZE = 160;
+    //  288  bytes  + chirp NCO, recv->transmit spike stats,
+    //              TX drop diagnostics                       -- unified/perf
+    // The buffer must be sized to at least the largest known form, or extra
+    // bytes will sit unread in the TCP queue and corrupt the next command's
+    // ACK. The parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and
+    // decodes optional fields based on what the device actually sent, so
+    // newer firmware that grows the response further will still parse — we
+    // just leave the extra headroom empty.
+    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // buffer, with room to grow
     constexpr size_t STATUS_RESPONSE_SIZE_LFP = 160;
     constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
@@ -457,13 +461,10 @@ public:
             return false;
         }
 
-        // Accept any of the known sizes (see STATUS_RESPONSE_SIZE comment).
-        if (dataLen != STATUS_RESPONSE_SIZE_LFP &&
-            dataLen != STATUS_RESPONSE_SIZE_RHD &&
-            dataLen != STATUS_RESPONSE_SIZE_AUXCTRL &&
-            dataLen != STATUS_RESPONSE_SIZE_PERF &&
-            dataLen != STATUS_RESPONSE_SIZE_AUX &&
-            dataLen != STATUS_RESPONSE_SIZE_LEGACY) {
+        // Accept any size >= LEGACY (see STATUS_RESPONSE_SIZE comment). The
+        // parser below decodes optional blocks by their length threshold, so
+        // future firmware that grows the response only adds bytes we ignore.
+        if (dataLen < STATUS_RESPONSE_SIZE_LEGACY) {
             return false;
         }
         
@@ -941,24 +942,128 @@ public:
         if (tcpSocket_ == INVALID_SOCKET) {
             return false;
         }
-        
+
         struct sockaddr_in serverAddr;
         std::memset(&serverAddr, 0, sizeof(serverAddr));
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(tcpPort_);
-        
+
         if (inet_pton(AF_INET, deviceIp_.c_str(), &serverAddr.sin_addr) != 1) {
             closesocket(tcpSocket_);
             tcpSocket_ = INVALID_SOCKET;
             return false;
         }
-        
-        if (connect(tcpSocket_, reinterpret_cast<struct sockaddr*>(&serverAddr),
-                   sizeof(serverAddr)) == SOCKET_ERROR) {
-            closesocket(tcpSocket_);
-            tcpSocket_ = INVALID_SOCKET;
-            return false;
+
+        // Non-blocking connect + select() with a bounded timeout, so a not-
+        // yet-ready board (still booting its network stack) fails fast
+        // instead of stalling the JUCE UI thread on the kernel's default TCP
+        // connect timeout (minutes). The 15 s bound is long enough to cover
+        // the common cases where macOS pauses on first-time ARP resolution
+        // for the board's IP, but short enough that the user isn't sitting
+        // in front of a frozen UI. If a prior attempt POISONED macOS's ARP
+        // cache with a negative entry (clicking CONNECT before the board's
+        // lwIP was up), even a fresh connect from ANY tool -- including
+        // net.py -- will fail with EHOSTUNREACH for ~20 s. Either wait for
+        // the cache to age out or run `sudo arp -d <BOARD_IP>` to clear it.
+        constexpr int CONNECT_TIMEOUT_SEC = 15;
+#ifdef _WIN32
+        u_long nb = 1;
+        ioctlsocket(tcpSocket_, FIONBIO, &nb);
+#else
+        int flags = fcntl(tcpSocket_, F_GETFL, 0);
+        if (flags != -1)
+            fcntl(tcpSocket_, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+        int cr = connect(tcpSocket_,
+                         reinterpret_cast<struct sockaddr*>(&serverAddr),
+                         sizeof(serverAddr));
+        if (cr == SOCKET_ERROR) {
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            const bool pending = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
+#else
+            const int err = errno;
+            const bool pending = (err == EINPROGRESS || err == EWOULDBLOCK);
+#endif
+            if (!pending) {
+                std::cout << "[IntanInterface] connectTcp: connect() failed err="
+                          << err
+#ifndef _WIN32
+                          << " (" << std::strerror(err) << ")"
+                          << (err == EHOSTUNREACH
+                              ? "  -- macOS ARP cache holds a negative entry"
+                                " for this IP. Wait ~20 s or run: sudo arp -d "
+                              : "")
+                          << (err == EHOSTUNREACH ? deviceIp_ : std::string(""))
+#endif
+                          << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
+
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_SET(tcpSocket_, &wfds);
+            FD_ZERO(&efds); FD_SET(tcpSocket_, &efds);
+            struct timeval tvc;
+            tvc.tv_sec  = CONNECT_TIMEOUT_SEC;
+            tvc.tv_usec = 0;
+            int sel = select((int)tcpSocket_ + 1, nullptr, &wfds, &efds, &tvc);
+            if (sel < 0) {
+                std::cout << "[IntanInterface] connectTcp: select() error errno="
+                          << errno << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
+            if (sel == 0) {
+                // Timeout. The board isn't listening yet -- most common cause
+                // is trying to CONNECT before the Zynq's lwIP stack is up
+                // (~5-20 s after boot). Try again in a couple seconds.
+                std::cout << "[IntanInterface] connectTcp: connect timeout after "
+                          << CONNECT_TIMEOUT_SEC << "s to " << deviceIp_
+                          << ":" << tcpPort_
+                          << " (board still booting? retry in a few seconds)"
+                          << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
+
+            // Check SO_ERROR to confirm connect() actually succeeded (select
+            // returns writable on refused connections too).
+            int soerr = 0;
+            socklen_t soerrlen = sizeof(soerr);
+            int goe = getsockopt(tcpSocket_, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char*>(&soerr), &soerrlen);
+            if (goe != 0 || soerr != 0) {
+                std::cout << "[IntanInterface] connectTcp: SO_ERROR="
+                          << soerr
+#ifndef _WIN32
+                          << " (" << std::strerror(soerr) << ")"
+                          << (soerr == EHOSTUNREACH
+                              ? "  -- macOS ARP cache holds a negative entry"
+                                " for this IP. Wait ~20 s or run: sudo arp -d "
+                              : "")
+                          << (soerr == EHOSTUNREACH ? deviceIp_ : std::string(""))
+#endif
+                          << " (getsockopt rc=" << goe << ")" << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
         }
+
+        // Restore blocking mode for the rest of the session (send/recv use
+        // SO_SNDTIMEO/SO_RCVTIMEO for their bounds).
+#ifdef _WIN32
+        u_long nb0 = 0;
+        ioctlsocket(tcpSocket_, FIONBIO, &nb0);
+#else
+        if (flags != -1)
+            fcntl(tcpSocket_, F_SETFL, flags);
+#endif
 
         // Bound how long a single command can wait for a response. Without
         // this, recv() blocks indefinitely if the board's TCP stack stalls
@@ -1816,37 +1921,92 @@ bool IntanInterface::lfpUploadCoefs(const std::vector<int32_t>& coefs) {
     return pImpl_->lfpUploadCoefs(coefs);
 }
 
-// Windowed-sinc (Hamming) low-pass FIR, unity DC gain, quantized to Q1.17
-// signed. Exact port of remote/net.py design_lfp_lowpass() so the plugin
-// and net.py produce bit-identical kernels at the same params.
-std::vector<int32_t> IntanInterface::lfpDesignLowpass(int numTaps,
-                                                     double cutoffHz,
-                                                     double fs) {
-    const double fc = cutoffHz / fs;           // normalised cutoff (cycles/sample)
-    const double M  = numTaps - 1.0;
-    std::vector<double> h(numTaps);
-    for (int n = 0; n < numTaps; ++n) {
-        double x = (double)n - M / 2.0;
-        double s;
-        if (std::fabs(x) < 1e-9) {
-            s = 2.0 * fc;                       // sinc at zero
-        } else {
-            s = std::sin(2.0 * M_PI * fc * x) / (M_PI * x);
+namespace {
+// Kaiser window via the I0 Bessel series (no external dependency). Exact port
+// of remote/net.py _kaiser_window() so lfpDesignCicCompFir stays bit-identical
+// to net.py at the same params.
+std::vector<double> kaiserWindow(int numTaps, double beta) {
+    auto i0 = [](double x) {
+        double s = 1.0, t = 1.0;
+        for (int k = 1; k < 200; ++k) {
+            t *= (x * x) / (4.0 * k * k);
+            s += t;
+            if (t < 1e-12 * s) break;
         }
-        double w = 0.54 - 0.46 * std::cos(2.0 * M_PI * (double)n / M);  // Hamming
-        h[n] = s * w;
+        return s;
+    };
+    const double a = (numTaps - 1) / 2.0;
+    const double denom = i0(beta);
+    std::vector<double> w(numTaps);
+    for (int n = 0; n < numTaps; ++n) {
+        const double u = (n - a) / a;
+        const double arg = beta * std::sqrt(std::max(0.0, 1.0 - u * u));
+        w[n] = i0(arg) / denom;
     }
-    double g = 0.0;
-    for (double v : h) g += v;
-    if (g == 0.0) g = 1.0;
+    return w;
+}
+} // namespace
 
-    const int32_t scale = 1 << LfpDefaults::COEF_FRAC;   // 1<<17
-    const int32_t lim   = 1 << LfpDefaults::COEF_FRAC;   // also 1<<17 (clamp limit)
+// Droop-compensated comp-FIR halfband for the shipped USE_CIC=1 datapath
+// (CIC^4(/5) -> FIR(/2) = /10). Frequency-sampling design at the CIC output
+// rate fs_in/R_cic (6 kHz) with target = 1/CIC-droop, unity DC gain, Kaiser
+// window, quantized to Q1.17. Exact port of remote/net.py design_cic_comp_fir()
+// so the plugin and net.py upload bit-identical kernels.
+std::vector<int32_t> IntanInterface::lfpDesignCicCompFir(int numTaps, double fc,
+                                                        double beta, int R_cic,
+                                                        int nOrder, int gainShift,
+                                                        double fsIn) {
+    const double fs1 = fsIn / (double)R_cic;    // comp-FIR input rate (6 kHz)
+
+    auto cicMag = [&](double f) {
+        const double w = M_PI * f / fsIn;
+        if (std::fabs(w) < 1e-12) return 1.0;
+        const double d = (double)R_cic * std::sin(w);
+        if (std::fabs(d) < 1e-15) return 1.0;
+        const double r = std::sin((double)R_cic * w) / d;
+        double acc = 1.0;
+        for (int k = 0; k < nOrder; ++k) acc *= r;
+        return acc;
+    };
+
+    const double cicDc = std::pow((double)R_cic, (double)nOrder)
+                       / (double)(1 << gainShift);
+
+    const auto win = kaiserWindow(numTaps, beta);
+    const double M = numTaps - 1.0;
+    const double a = M / 2.0;
+
+    auto desired = [&](double f) {
+        if (f > fc) return 0.0;
+        const double dr = cicMag(f);
+        return (dr > 1e-6) ? (1.0 / dr) : 1.0;
+    };
+
+    const int L = 2048;
+    std::vector<double> h(numTaps, 0.0);
+    const double df = (fs1 / 2.0) / (double)L;
+    for (int n = 0; n < numTaps; ++n) {
+        double acc = 0.0;
+        for (int k = 0; k <= L; ++k) {
+            const double f = df * (double)k;
+            const double wgt = (k == 0 || k == L) ? 0.5 : 1.0;
+            acc += wgt * desired(f) * std::cos(2.0 * M_PI * f * ((double)n - a) / fs1);
+        }
+        h[n] = acc * df * 2.0 / (fs1 / 2.0) * win[n];
+    }
+
+    double dc = 0.0;
+    for (double v : h) dc += v;
+    if (dc == 0.0) dc = 1.0;
+    const double normGain = (1.0 / cicDc) / dc;
+    for (double& v : h) v *= normGain;
+
+    const int32_t scale = 1 << LfpDefaults::COEF_FRAC;
+    const int32_t lim   = 1 << LfpDefaults::COEF_FRAC;
     std::vector<int32_t> coefs(numTaps);
     for (int n = 0; n < numTaps; ++n) {
-        double normalised = h[n] / g * (double)scale;
-        long long q = (long long)std::llround(normalised);
-        if (q >  lim - 1) q = lim - 1;
+        long long q = (long long)std::llround(h[n] * (double)scale);
+        if (q >  lim - 1) q =  lim - 1;
         if (q < -lim)     q = -lim;
         coefs[n] = (int32_t)q;
     }

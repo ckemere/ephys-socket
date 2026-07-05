@@ -223,10 +223,50 @@ bool IntanSocket::connectDevice(bool printOutput)
         // Aux sequencer state (already persisted across reconnect)
         auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
 
-        // LFP/DSP engine state -- mirror from device. If LFP is enabled in
-        // the firmware (configured + started via the external tool), we'll
-        // publish a SECOND DataStream in updateSettings sized for the active
-        // lane mask + decimation rate. If disabled, no LFP stream.
+        // LFP/DSP engine state -- mirror from device. If the firmware retains
+        // an LFP config from a previous session, adopt it -- UNLESS it's
+        // incompatible with the shipped USE_CIC=1 PL (decim_R != 10 or
+        // num_taps > 64, which silently wraps HB_TAPN_W=7 and scrambles the
+        // halfband filter). In the incompatible case the engine emits 1 valid
+        // frame per ~136 and the host sees 135-per-1 SEQ gaps; the previous
+        // plugin build shipped a buggy default (decim_R=15 / num_taps=128)
+        // that leaves this exact state stuck in firmware until reboot. Force-
+        // reapply the CIC defaults here so the plugin's internal state and
+        // the firmware always agree AND the stream is actually clean.
+        {
+            using D = IntanInterface::LfpDefaults;
+            // Only reconfigure if the engine is actually going to emit
+            // (lfpEnabled) AND its config can't produce sensible data:
+            //   decim_R != 10   -> mismatches the hardwired CIC /10 chain
+            //   num_taps == 0   -> halfband RAM is unloaded; garbage output
+            //   num_taps > 64   -> HB_TAPN_W=7 overflow; scrambled halfband
+            // A sensible custom config from net.py (decim_R=10, 0<taps<=64)
+            // is left alone.
+            const bool cicIncompatible = status.hasLfpStatus
+                && status.lfpEnabled
+                && (status.lfpDecimR != D::DECIM_R
+                    || status.lfpNumTaps == 0
+                    || status.lfpNumTaps > 64);
+            if (cicIncompatible)
+            {
+                LOGC("LFP: firmware config (decim=", (int)status.lfpDecimR,
+                     " taps=", (int)status.lfpNumTaps,
+                     ") not CIC-compatible -- reapplying defaults at connect");
+                if (configureLfpDefaults()
+                    && intanInterface->lfpEnable(true)
+                    && intanInterface->getStatus(status))
+                {
+                    // status is now refreshed; fall through to the mirror block
+                }
+                else
+                {
+                    LOGE("LFP: reconfigure at connect failed -- disabling LFP");
+                    intanInterface->lfpEnable(false);
+                    status.lfpEnabled = false;
+                }
+            }
+        }
+
         if (status.hasLfpStatus && status.lfpEnabled
             && status.lfpLaneMask != 0 && status.lfpDecimR != 0)
         {
@@ -1334,21 +1374,23 @@ bool IntanSocket::configureLfpDefaults()
     }
     using D = IntanInterface::LfpDefaults;
 
-    // Mirror remote/net.py configure_lfp() ordering: disable, set channels,
-    // set params, design + upload coefficients. Caller enables afterwards.
+    // Mirror remote/net.py configure_lfp("cic") ordering: disable, set channels,
+    // set params, design + upload the CIC-droop-compensated comp-FIR halfband
+    // kernel. Caller enables afterwards. This matches the shipped USE_CIC=1
+    // PL (CIC^4(/5) -> FIR(/2) = /10 -> 3 kHz LFP); a plain lowpass at
+    // decim_R=15 does NOT match this datapath.
     if (!intanInterface->lfpEnable(false))             return false;
     if (!intanInterface->lfpSetChannels(D::LANE_MASK)) return false;
     if (!intanInterface->lfpSetParams(D::DECIM_R, D::NUM_TAPS)) return false;
 
-    auto coefs = IntanInterface::lfpDesignLowpass(D::NUM_TAPS, D::CUTOFF_HZ, D::FS);
+    auto coefs = IntanInterface::lfpDesignCicCompFir();   // uses LfpDefaults
     if ((int)coefs.size() != D::NUM_TAPS)              return false;
     if (!intanInterface->lfpUploadCoefs(coefs))        return false;
 
-    LOGC("LFP defaults applied: lane=0x", String::toHexString((int)D::LANE_MASK),
-         " decim=", (int)D::DECIM_R,
+    LOGC("LFP defaults applied (CIC comp-FIR): decim=", (int)D::DECIM_R,
          " (", (int)(D::FS / D::DECIM_R), " Hz)",
          " taps=", (int)D::NUM_TAPS,
-         " cutoff=", (int)D::CUTOFF_HZ, " Hz");
+         " fc=", (int)D::CUTOFF_HZ, " Hz");
     return true;
 }
 
@@ -1379,15 +1421,17 @@ bool IntanSocket::setLfpEnabled(bool enable)
             CoreServices::sendStatusMessage("Intan: firmware lacks LFP engine");
             return false;
         }
-        if (s.lfpLaneMask == 0 || s.lfpDecimR == 0)
+        // Always reapply the defaults on enable -- matches net.py's flow
+        // (configure_lfp("cic") before lfp_enable). This is the "just make
+        // it work" affordance: even if firmware's cached decim_R/num_taps
+        // happen to match the defaults, num_taps=0 (fresh boot) or a stale
+        // coefficient RAM will silently produce broken data. Users who want
+        // a custom filter push it via remote/net.py AFTER the button is on.
+        if (!configureLfpDefaults())
         {
-            LOGC("LFP: no firmware config yet -- applying net.py defaults");
-            if (!configureLfpDefaults())
-            {
-                LOGE("LFP: default configure failed");
-                CoreServices::sendStatusMessage("Intan: LFP configure failed");
-                return false;
-            }
+            LOGE("LFP: default configure failed");
+            CoreServices::sendStatusMessage("Intan: LFP configure failed");
+            return false;
         }
     }
 

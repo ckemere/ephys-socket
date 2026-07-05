@@ -639,22 +639,35 @@ public:
     /** Convenience: upload a full coefficient set in order (first call clears). */
     bool lfpUploadCoefs(const std::vector<int32_t>& coefs);
 
-    /** Default LFP-engine parameters (mirror remote/net.py configure_lfp). */
+    /** Default LFP-engine parameters, matching remote/net.py configure_lfp
+     *  and the PL's LFP datapath: CIC^4(/5) -> comp-FIR halfband(/2) = /10,
+     *  hardwired -> 3 kHz output. num_taps drives the halfband filter and
+     *  must be <= HB_RING = 64; 43 matches net.py. */
     struct LfpDefaults {
-        static constexpr uint8_t LANE_MASK = 0x0F;     // port A, all 4 streams
-        static constexpr uint8_t DECIM_R   = 15;       // 30000 / 15 = 2000 Hz
-        static constexpr uint8_t NUM_TAPS  = 128;
-        static constexpr double  CUTOFF_HZ = 600.0;
-        static constexpr double  FS        = 30000.0;
-        static constexpr int     COEF_FRAC = 17;       // Q1.17
+        static constexpr uint8_t LANE_MASK      = 0x0F;   // legacy; PL ignores (mirrors broadband)
+        static constexpr uint8_t DECIM_R        = 10;     // CIC hardwired /10 -> 3 kHz
+        static constexpr uint8_t NUM_TAPS       = 43;     // halfband comp-FIR (<= HB_RING=64)
+        static constexpr double  CUTOFF_HZ      = 1300.0; // comp-FIR fc (CIC-droop target)
+        static constexpr double  KAISER_BETA    = 6.0;
+        static constexpr int     CIC_R          = 5;
+        static constexpr int     CIC_ORDER      = 4;
+        static constexpr int     CIC_GAIN_SHIFT = 10;
+        static constexpr double  FS             = 30000.0;
+        static constexpr int     COEF_FRAC      = 17;     // Q1.17
     };
 
-    /** Design a windowed-sinc (Hamming) low-pass FIR with unity DC gain,
-     *  quantized to Q1.17 signed (18-bit). Exactly mirrors net.py's
-     *  design_lfp_lowpass(); use for the default configure path. */
-    static std::vector<int32_t> lfpDesignLowpass(int numTaps,
-                                                 double cutoffHz,
-                                                 double fs = LfpDefaults::FS);
+    /** Design the droop-compensated comp-FIR halfband kernel for the PL's
+     *  CIC^4(/5) -> FIR(/2) datapath. Kaiser-windowed frequency-sampling
+     *  design at the CIC output rate fs_in/R_cic (6 kHz), target = 1/CIC-droop,
+     *  unity DC gain, Q1.17 signed. Exact port of net.py's design_cic_comp_fir. */
+    static std::vector<int32_t> lfpDesignCicCompFir(
+        int numTaps    = LfpDefaults::NUM_TAPS,
+        double fc      = LfpDefaults::CUTOFF_HZ,
+        double beta    = LfpDefaults::KAISER_BETA,
+        int R_cic      = LfpDefaults::CIC_R,
+        int nOrder     = LfpDefaults::CIC_ORDER,
+        int gainShift  = LfpDefaults::CIC_GAIN_SHIFT,
+        double fsIn    = LfpDefaults::FS);
 
     // ========================================================================
     // CALLBACKS
