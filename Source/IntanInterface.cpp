@@ -1176,6 +1176,18 @@ public:
             // Linux reports double the value it actually reserves.
             std::cout << "[IntanInterface] UDP SO_RCVBUF = " << (gotbuf / 1024)
                       << " KB (requested " << (rcvbuf / 1024) << " KB)" << std::endl;
+            // If the OS clamped it well below the request, the kernel drops UDP
+            // under any brief stall -> broadband SEQ gaps that net.py (on a box
+            // with a larger granted buffer) never sees. Surface it loudly with
+            // the exact fix so it isn't silently the cause.
+            if (gotbuf < rcvbuf) {
+                std::cout << "[IntanInterface] WARNING: SO_RCVBUF was CLAMPED to "
+                          << (gotbuf / 1024) << " KB (< requested " << (rcvbuf / 1024)
+                          << " KB). Raise the OS limit to avoid UDP drops under load: "
+                          << "macOS  'sudo sysctl -w kern.ipc.maxsockbuf=33554432' ; "
+                          << "Linux  'sudo sysctl -w net.core.rmem_max=16777216'."
+                          << std::endl;
+            }
         }
 
         // Bind to the unified UDP port.
@@ -1333,12 +1345,19 @@ public:
                 if (delta == 0) {
                     // Contiguous (including the 32-bit wrap) -- no loss.
                 } else if (delta < 0x80000000u) {
-                    // FORWARD gap => genuinely dropped LFP frame(s).
+                    // FORWARD gap => genuinely dropped LFP frame(s). Count always,
+                    // throttle the log (see the broadband path for why).
                     lfpSeqGaps_++;
                     lfpLostFrames_ += delta;
-                    std::cout << "[IntanInterface][LOSS] LFP SEQ gap: expected "
-                              << expectedSeq << ", got " << seq << " (+" << delta
-                              << " missing). lfp_seq_gaps=" << lfpSeqGaps_ << std::endl;
+                    static thread_local std::chrono::steady_clock::time_point lastLfpLoss{};
+                    auto nowTp = std::chrono::steady_clock::now();
+                    if (nowTp - lastLfpLoss > std::chrono::seconds(1)) {
+                        lastLfpLoss = nowTp;
+                        std::cout << "[IntanInterface][LOSS] LFP SEQ gap: expected "
+                                  << expectedSeq << ", got " << seq << " (+" << delta
+                                  << " missing). lfp_seq_gaps=" << lfpSeqGaps_
+                                  << " (throttled)" << std::endl;
+                    }
                 } else {
                     // BACKWARD jump => stream restart (SEQ resets on START); resync
                     // silently, not archival loss.
@@ -1402,8 +1421,16 @@ public:
             return;
         }
         
-        // Unpack as 32-bit words
-        std::vector<uint32_t> words(expectedPacketSizeWords_);
+        // Unpack as 32-bit words. Reuse a per-thread buffer instead of allocating
+        // a fresh vector on every packet: at 30 kHz a per-packet heap alloc here
+        // (plus the ones on the recv + queue paths) churns the global allocator
+        // and its latency drifts up over minutes -> a stall eventually overflows
+        // the socket buffer -> SEQ gap. net.py stays clean by never allocating on
+        // the hot path. This function only ever runs on the demux thread, so a
+        // thread_local buffer is safe. resize() to the same size is a no-op.
+        static thread_local std::vector<uint32_t> words;
+        if (words.size() != expectedPacketSizeWords_)
+            words.resize(expectedPacketSizeWords_);
         for (size_t i = 0; i < expectedPacketSizeWords_; ++i) {
             words[i] = unpackU32LE(&data[i * 4]);
         }
@@ -1434,15 +1461,24 @@ public:
             if (delta == 0) {
                 // Contiguous (including the natural 32-bit wrap) -- no loss.
             } else if (delta < 0x80000000u) {
-                // FORWARD gap => genuinely lost broadband packet(s). Archival
-                // stream: surface it loudly.
+                // FORWARD gap => genuinely lost broadband packet(s). Always COUNT
+                // it (the counters are the truth), but THROTTLE the log to at most
+                // once/second: printing a blocking std::cout under statsMutex_ on
+                // the demux thread for every gap slows the demux thread, backs up
+                // the ring, and causes MORE drops -> a self-amplifying cascade.
                 seqGaps_++;
                 seqLostPackets_ += delta;
                 timestampErrors_++;   // keep the legacy "loss" counter moving too
                 totalErrors_++;
-                std::cout << "[IntanInterface][LOSS] Broadband SEQ gap: expected "
-                          << expectedSeq << ", got " << seq << " (+" << delta
-                          << " missing). bb_seq_gaps=" << seqGaps_ << std::endl;
+                static thread_local std::chrono::steady_clock::time_point lastBbLoss{};
+                auto nowTp = std::chrono::steady_clock::now();
+                if (nowTp - lastBbLoss > std::chrono::seconds(1)) {
+                    lastBbLoss = nowTp;
+                    std::cout << "[IntanInterface][LOSS] Broadband SEQ gap: expected "
+                              << expectedSeq << ", got " << seq << " (+" << delta
+                              << " missing). bb_seq_gaps=" << seqGaps_
+                              << " (throttled)" << std::endl;
+                }
             } else {
                 // seq < expectedSeq => a BACKWARD jump: the broadband stream
                 // RESTARTED (firmware resets/resyncs the SEQ on START -- e.g. the

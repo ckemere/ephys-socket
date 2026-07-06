@@ -215,6 +215,12 @@ private:
     };
     std::queue<DataPacket> dataQueue;
     std::mutex queueMutex;
+    // Bounded safety valve: dataQueue was unbounded, so if the Open Ephys consumer
+    // ever fell behind it grew without limit -> memory bloat -> allocator latency
+    // -> recv/demux stalls -> kernel UDP drops (SEQ gaps) after minutes. Cap it and
+    // drop-oldest with a counter instead. ~4 s of headroom at 30 kHz.
+    static constexpr size_t kMaxDataQueue = 120000;
+    std::atomic<uint64_t> dataQueueDrops_ { 0 };
     
     /** Buffers for conversion */
     std::vector<float> convbuf;

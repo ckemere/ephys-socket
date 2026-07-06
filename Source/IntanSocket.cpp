@@ -688,12 +688,20 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
     // Queue the packet for processing in updateBuffer()
     
     std::lock_guard<std::mutex> lock(queueMutex);
-    
+
+    if (dataQueue.size() >= kMaxDataQueue) {
+        // Consumer fell behind -> drop the OLDEST and count it, rather than grow
+        // the queue without bound (see kMaxDataQueue note). A counted, bounded
+        // drop here is far better than the uncounted allocator-stall spiral.
+        dataQueue.pop();
+        dataQueueDrops_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     DataPacket packet;
     packet.data.assign(data, data + wordCount);
     packet.timestamp = timestamp;
-    
-    dataQueue.push(packet);
+
+    dataQueue.push(std::move(packet));   // move, not copy
 }
 
 void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
@@ -740,8 +748,8 @@ bool IntanSocket::updateBuffer()
         std::lock_guard<std::mutex> lock(queueMutex);
         if (dataQueue.empty())
             return true;
-        
-        packet = dataQueue.front();
+
+        packet = std::move(dataQueue.front());   // move out, no copy
         dataQueue.pop();
     }
 
