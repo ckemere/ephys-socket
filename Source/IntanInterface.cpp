@@ -151,13 +151,17 @@ namespace {
     //   w14..   = DATA words
     constexpr size_t PACKET_HEADER_WORDS = 14;
 
-    // Cable-detection scans from a fixed empirical offset of 8 words (matches
-    // remote/net.py _score_channel's `data_words = packet[8:]`). With the
-    // unified header that lands on the same INTAN/chip-ID/MISO positions as
-    // before (the +2 SPI-pipeline delay is applied inside the scorer). Do NOT
-    // change this to PACKET_HEADER_WORDS -- the detection lock is calibrated to
-    // 8, exactly as net.py is.
-    constexpr size_t CABLE_TEST_DATA_OFFSET_WORDS = 8;
+    // Cable detection slices the data section at the broadband header boundary,
+    // which MUST equal the real header size. The RTL always writes a 14-word
+    // header (7 fixed FIFO header writes, mask 0x0F -> 14 BRAM words) regardless
+    // of channel_enable, and the chip DATA words (the INTAN/chip-ID/MISO readback)
+    // begin at word 14 -- confirmed in data_generator_core.sv. The old value 8
+    // was a leftover from before the unified header grew from 10 to 14: it made
+    // the scorer read 6 header/sub-block words (aux echoes, ADC breadcrumbs) as
+    // data and mis-locate every lane, so RESCAN never scored above threshold.
+    // (net.py's `packet[8:]` had the identical bug.) Derive it from the header
+    // size so this can never silently drift again when the header changes.
+    constexpr size_t CABLE_TEST_DATA_OFFSET_WORDS = PACKET_HEADER_WORDS;
     
     // Auto-detection constants
     constexpr uint16_t INTAN_PATTERN[] = {0x0049, 0x004E, 0x0054, 0x0041, 0x004E};  // 'I','N','T','A','N'
@@ -190,8 +194,10 @@ namespace {
     // RTL: `loop_limit_reached <= (loop_count != 0) && (counter >= loop_count)`,
     // so 0 is the "no limit" sentinel.
     constexpr uint32_t DETECTION_LOOP_COUNT = 0;
-    // Cable test now uses ce=0xFF (both ports, all 8 streams) so port A and
-    // port B are tested in parallel; packet has 10 header + 140 data = 150 words.
+    // Cable test uses ce=0xFF (both ports, all 8 streams) so ports A and B are
+    // detected in PARALLEL: each SPI cycle emits 4 words, one per lane
+    // (A-CIPO0, A-CIPO1, B-CIPO0, B-CIPO1) at stride 4 / offsets 0..3; 35 cycles
+    // -> 140 data words, so the packet is 14-word unified header + 140 = 154 words.
     constexpr uint8_t  DETECTION_CHANNEL_ENABLE = 0xFF;
 }
 
