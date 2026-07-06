@@ -1329,13 +1329,19 @@ public:
             std::lock_guard<std::mutex> lock(statsMutex_);
             if (lfpHaveSeq_) {
                 uint32_t expectedSeq = lfpLastSeq_ + 1;  // wraps at 2^32 naturally
-                if (seq != expectedSeq) {
-                    uint32_t missing = seq - expectedSeq;  // mod 2^32
+                uint32_t delta = seq - expectedSeq;      // mod 2^32
+                if (delta == 0) {
+                    // Contiguous (including the 32-bit wrap) -- no loss.
+                } else if (delta < 0x80000000u) {
+                    // FORWARD gap => genuinely dropped LFP frame(s).
                     lfpSeqGaps_++;
-                    lfpLostFrames_ += missing;
+                    lfpLostFrames_ += delta;
                     std::cout << "[IntanInterface][LOSS] LFP SEQ gap: expected "
-                              << expectedSeq << ", got " << seq << " (+" << missing
+                              << expectedSeq << ", got " << seq << " (+" << delta
                               << " missing). lfp_seq_gaps=" << lfpSeqGaps_ << std::endl;
+                } else {
+                    // BACKWARD jump => stream restart (SEQ resets on START); resync
+                    // silently, not archival loss.
                 }
             }
             lfpLastSeq_ = seq;
@@ -1423,16 +1429,25 @@ public:
         // DataValidator's SEQ check; replaces the old timestamp-delta heuristic
         // as the authoritative loss signal.)
         if (haveSeq_) {
-            uint32_t expectedSeq = lastSeq_ + 1;   // wraps at 2^32 naturally
-            if (seq != expectedSeq) {
-                uint32_t missing = seq - expectedSeq;   // mod 2^32
+            uint32_t expectedSeq = lastSeq_ + 1;      // wraps at 2^32 naturally
+            uint32_t delta = seq - expectedSeq;       // mod 2^32
+            if (delta == 0) {
+                // Contiguous (including the natural 32-bit wrap) -- no loss.
+            } else if (delta < 0x80000000u) {
+                // FORWARD gap => genuinely lost broadband packet(s). Archival
+                // stream: surface it loudly.
                 seqGaps_++;
-                seqLostPackets_ += missing;
+                seqLostPackets_ += delta;
                 timestampErrors_++;   // keep the legacy "loss" counter moving too
                 totalErrors_++;
                 std::cout << "[IntanInterface][LOSS] Broadband SEQ gap: expected "
-                          << expectedSeq << ", got " << seq << " (+" << missing
+                          << expectedSeq << ", got " << seq << " (+" << delta
                           << " missing). bb_seq_gaps=" << seqGaps_ << std::endl;
+            } else {
+                // seq < expectedSeq => a BACKWARD jump: the broadband stream
+                // RESTARTED (firmware resets/resyncs the SEQ on START -- e.g. the
+                // 16 START/STOP cycles of cable detection). This is NOT archival
+                // loss; resync silently rather than reporting ~2^32 "missing".
             }
         }
         lastSeq_  = seq;
