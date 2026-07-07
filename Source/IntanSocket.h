@@ -139,8 +139,8 @@ public:
     bool setAuxSequencerMode(bool enable);
     bool isAuxSequencerMode() const { return auxSeqMode; }
 
-    /** Enable / disable the firmware's LFP/DSP engine + the second
-        UDP stream (port 5001). When enabling and the firmware has no
+    /** Enable / disable the firmware's LFP/DSP engine. LFP frames arrive on the
+        SAME unified UDP port as broadband (stream_type=2). When enabling and the firmware has no
         configuration yet (lane_mask = 0 or decim_R = 0), this first
         applies a default configure -- same values as remote/net.py's
         configure_lfp(): 0x0F lane mask, decim 10 (3 kHz output), 128-tap
@@ -215,6 +215,12 @@ private:
     };
     std::queue<DataPacket> dataQueue;
     std::mutex queueMutex;
+    // Bounded safety valve: dataQueue was unbounded, so if the Open Ephys consumer
+    // ever fell behind it grew without limit -> memory bloat -> allocator latency
+    // -> recv/demux stalls -> kernel UDP drops (SEQ gaps) after minutes. Cap it and
+    // drop-oldest with a counter instead. ~4 s of headroom at 30 kHz.
+    static constexpr size_t kMaxDataQueue = 120000;
+    std::atomic<uint64_t> dataQueueDrops_ { 0 };
     
     /** Buffers for conversion */
     std::vector<float> convbuf;

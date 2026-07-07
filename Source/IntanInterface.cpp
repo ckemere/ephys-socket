@@ -9,6 +9,8 @@
 #include <chrono>
 #include <vector>
 #include <queue>
+#include <deque>
+#include <condition_variable>
 #include <cerrno>
 #include <array>
 #include <cmath>
@@ -37,8 +39,33 @@
 
 namespace {
     constexpr uint32_t CMD_MAGIC = 0xDEADBEEF;
+    // Legacy two-word packet magic {0xDEADBEEF, 0xCAFEBABE}. The UNIFIED format
+    // (docs/unified-packet-format.md) replaces this with a single-word MAGIC in
+    // header word 0 plus a stream_type byte in word 1 (see below). Kept only for
+    // historical reference / the command protocol (CMD_MAGIC is unchanged).
     constexpr uint32_t PACKET_MAGIC_LOW = 0xDEADBEEF;
     constexpr uint32_t PACKET_MAGIC_HIGH = 0xCAFEBABE;
+
+    // ------------------------------------------------------------------------
+    // UNIFIED single-port packet format (matches mz-unified-ports firmware,
+    // branch claude/unified-ports; authoritative spec docs/unified-packet-
+    // format.md, host reference remote/net.py UnifiedSink). EVERY PL->host
+    // stream arrives on ONE UDP port (default 5000) and carries the same
+    // 8-word little-endian common header; the host demuxes by stream_type.
+    //   w0 MAGIC = 0xCAFEBABE
+    //   w1 TYPE_VER = stream_type[7:0] | version[15:8] | flags[31:16]
+    //   w2/w3 = 64-bit master timestamp
+    //   w4 = per-stream SEQ (+1 per packet of that stream -- the loss check)
+    //   w5 = AUX0  (stream-specific)
+    //   w6 = AUX1  (stream-specific)
+    //   w7 = RSVD
+    constexpr uint32_t UNIFIED_MAGIC          = 0xCAFEBABE;
+    constexpr uint8_t  UNIFIED_VERSION        = 1;
+    constexpr size_t   COMMON_HEADER_WORDS    = 8;   // the 8 shared header words
+    constexpr uint8_t  STREAM_TYPE_BROADBAND  = 1;
+    constexpr uint8_t  STREAM_TYPE_LFP        = 2;
+    constexpr uint8_t  STREAM_TYPE_WAVELET    = 3;   // reserved (follow-on branch)
+
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
     // Firmware status response has grown over time:
@@ -48,17 +75,15 @@ namespace {
     //  126  bytes  + aux_ctrl (CTRL_REG_22 readback)        -- 65d5fb5
     //  148  bytes  + rhd_reg[22] mirror (commanded chip cfg) -- 7fb41dc
     //  160  bytes  + lfp engine config + status              -- 0e99881
-    //  168  bytes  + analytic chirp NCO config (mode/stride/fspan/rate)
-    // The buffer must be sized to the largest known form, or extra bytes will
-    // sit unread in the TCP queue and corrupt the next command's ACK. The
-    // parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and decodes
-    // optional fields based on what the device actually sent -- any trailing
-    // bytes beyond the last block we parse are recv'd into the buffer (so the
-    // socket stays clean) but left unread, which is harmless. To make this
-    // survive future firmware growth without code changes, the receive buffer
-    // is sized with headroom above the current max.
-    constexpr size_t STATUS_RESPONSE_SIZE = 256;
-    constexpr size_t STATUS_RESPONSE_SIZE_CHIRP = 168;
+    //  288  bytes  + chirp NCO, recv->transmit spike stats,
+    //              TX drop diagnostics                       -- unified/perf
+    // The buffer must be sized to at least the largest known form, or extra
+    // bytes will sit unread in the TCP queue and corrupt the next command's
+    // ACK. The parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and
+    // decodes optional fields based on what the device actually sent, so
+    // newer firmware that grows the response further will still parse — we
+    // just leave the extra headroom empty.
+    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // buffer, with room to grow
     constexpr size_t STATUS_RESPONSE_SIZE_LFP = 160;
     constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
@@ -115,8 +140,28 @@ namespace {
     constexpr uint8_t ACK_SUCCESS = 0x06;
     constexpr uint8_t ACK_ERROR = 0x15;
     
-    // Packet header
-    constexpr size_t PACKET_HEADER_WORDS = 10;
+    // Broadband packet header (UNIFIED format): the 8-word common header PLUS a
+    // 6-word broadband sub-block = 14 header words ahead of the data words (the
+    // data words are byte-identical to the legacy stream). See net.py
+    // BB_HEADER_WORDS = 14 and docs/unified-packet-format.md "As implemented".
+    //   w0..w7  = common header (above)
+    //   w8      = sub-block: prev-packet slot-2/3 aux echoes (old header w5)
+    //   w9..w12 = sub-block: 8 external-ADC breadcrumbs (currently 0)
+    //   w13     = sub-block: reserved
+    //   w14..   = DATA words
+    constexpr size_t PACKET_HEADER_WORDS = 14;
+
+    // Cable detection slices the data section at the broadband header boundary,
+    // which MUST equal the real header size. The RTL always writes a 14-word
+    // header (7 fixed FIFO header writes, mask 0x0F -> 14 BRAM words) regardless
+    // of channel_enable, and the chip DATA words (the INTAN/chip-ID/MISO readback)
+    // begin at word 14 -- confirmed in data_generator_core.sv. The old value 8
+    // was a leftover from before the unified header grew from 10 to 14: it made
+    // the scorer read 6 header/sub-block words (aux echoes, ADC breadcrumbs) as
+    // data and mis-locate every lane, so RESCAN never scored above threshold.
+    // (net.py's `packet[8:]` had the identical bug.) Derive it from the header
+    // size so this can never silently drift again when the header changes.
+    constexpr size_t CABLE_TEST_DATA_OFFSET_WORDS = PACKET_HEADER_WORDS;
     
     // Auto-detection constants
     constexpr uint16_t INTAN_PATTERN[] = {0x0049, 0x004E, 0x0054, 0x0041, 0x004E};  // 'I','N','T','A','N'
@@ -130,7 +175,12 @@ namespace {
     constexpr uint16_t MISO_DDR_DDR = 0x3A;     // DDR word when DDR available
     constexpr uint16_t MISO_NO_DDR = 0x00;      // When no DDR
     
-    constexpr size_t CABLE_TEST_PACKET_SIZE_WORDS = 74;
+    // Reference only (detection sizes packets from the live channel_enable via
+    // expectedPacketSizeWords_). With ce=0x0F this is 14-word unified header +
+    // 70 data = 84 words (matches net.py CABLE_TEST_PACKET_SIZE_WORDS); ce=0xFF
+    // makes it 154. scoreChannel slices from CABLE_TEST_DATA_OFFSET_WORDS, so it
+    // is size-agnostic.
+    constexpr size_t CABLE_TEST_PACKET_SIZE_WORDS = 84;
     constexpr double DETECTION_THRESHOLD = 60.0;
     constexpr int NUM_PHASES_TO_TEST = 16;
 
@@ -144,8 +194,10 @@ namespace {
     // RTL: `loop_limit_reached <= (loop_count != 0) && (counter >= loop_count)`,
     // so 0 is the "no limit" sentinel.
     constexpr uint32_t DETECTION_LOOP_COUNT = 0;
-    // Cable test now uses ce=0xFF (both ports, all 8 streams) so port A and
-    // port B are tested in parallel; packet has 10 header + 140 data = 150 words.
+    // Cable test uses ce=0xFF (both ports, all 8 streams) so ports A and B are
+    // detected in PARALLEL: each SPI cycle emits 4 words, one per lane
+    // (A-CIPO0, A-CIPO1, B-CIPO0, B-CIPO1) at stride 4 / offsets 0..3; 35 cycles
+    // -> 140 data words, so the packet is 14-word unified header + 140 = 154 words.
     constexpr uint8_t  DETECTION_CHANNEL_ENABLE = 0xFF;
 }
 
@@ -196,11 +248,11 @@ public:
         , udpPort_(udpPort)
         , tcpSocket_(INVALID_SOCKET)
         , udpSocket_(INVALID_SOCKET)
-        , lfpSocket_(INVALID_SOCKET)
         , running_(false)
         , connected_(false)
         , currentChannelEnable_(0x0F)
-        , expectedPacketSizeWords_(74)
+        // 0x0F (4 streams) = 14-word unified header + 70 data words = 84 words.
+        , expectedPacketSizeWords_(84)
         , totalPackets_(0)
         , totalErrors_(0)
         , magicErrors_(0)
@@ -226,14 +278,18 @@ public:
         
         // Auto-configure UDP destination
         autoConfigureUdp();
-        
-        // Start UDP listener threads (broadband on udpPort_, LFP on fixed 5001).
-        // Both bind unconditionally: the LFP listener silently consumes nothing
-        // until the firmware's LFP engine is enabled.
+
+        // Start the UNIFIED UDP listener: ONE socket on udpPort_ (5000) carries
+        // ALL streams (broadband + LFP), demuxed by stream_type. Two threads:
+        //   * recvThread_  -- the hot path: recvfrom -> ring, nothing else, so
+        //                     broadband is NEVER blocked while a slow consumer
+        //                     processes a packet (the no-loss drain rule).
+        //   * demuxThread_ -- pops the ring, peeks stream_type, routes broadband
+        //                     to the data callback and LFP to the LFP callback.
         running_ = true;
-        udpThread_ = std::thread(&Impl::udpListenerThread, this);
-        lfpThread_ = std::thread(&Impl::lfpListenerThread, this);
-        
+        recvThread_  = std::thread(&Impl::udpRecvThread, this);
+        demuxThread_ = std::thread(&Impl::udpDemuxThread, this);
+
         // Give the listener a moment to bind so the device's reply about
         // udp_dest reflects post-autoConfigureUdp state.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -261,11 +317,15 @@ public:
     void shutdown() {
         running_ = false;
 
-        if (udpThread_.joinable()) {
-            udpThread_.join();
+        // Wake the demux thread if it's blocked on an empty ring so it can see
+        // running_ == false and exit promptly.
+        ringCv_.notify_all();
+
+        if (recvThread_.joinable()) {
+            recvThread_.join();
         }
-        if (lfpThread_.joinable()) {
-            lfpThread_.join();
+        if (demuxThread_.joinable()) {
+            demuxThread_.join();
         }
 
         if (tcpSocket_ != INVALID_SOCKET) {
@@ -278,11 +338,6 @@ public:
             udpSocket_ = INVALID_SOCKET;
         }
 
-        if (lfpSocket_ != INVALID_SOCKET) {
-            closesocket(lfpSocket_);
-            lfpSocket_ = INVALID_SOCKET;
-        }
-        
 #ifdef _WIN32
         WSACleanup();
 #endif
@@ -412,12 +467,9 @@ public:
             return false;
         }
 
-        // Accept any size at or above the oldest known layout. Each optional
-        // block below is gated on dataLen >= its introduction-size constant, so
-        // newer firmware that adds fields past the LFP block (e.g. the 168-byte
-        // analytic chirp NCO config) is consumed cleanly and the tail is just
-        // left unparsed. Rejecting unknown larger sizes here would break every
-        // future firmware bump (see git log -- this branch hit exactly that).
+        // Accept any size >= LEGACY (see STATUS_RESPONSE_SIZE comment). The
+        // parser below decodes optional blocks by their length threshold, so
+        // future firmware that grows the response only adds bytes we ignore.
         if (dataLen < STATUS_RESPONSE_SIZE_LEGACY) {
             return false;
         }
@@ -896,24 +948,128 @@ public:
         if (tcpSocket_ == INVALID_SOCKET) {
             return false;
         }
-        
+
         struct sockaddr_in serverAddr;
         std::memset(&serverAddr, 0, sizeof(serverAddr));
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(tcpPort_);
-        
+
         if (inet_pton(AF_INET, deviceIp_.c_str(), &serverAddr.sin_addr) != 1) {
             closesocket(tcpSocket_);
             tcpSocket_ = INVALID_SOCKET;
             return false;
         }
-        
-        if (connect(tcpSocket_, reinterpret_cast<struct sockaddr*>(&serverAddr),
-                   sizeof(serverAddr)) == SOCKET_ERROR) {
-            closesocket(tcpSocket_);
-            tcpSocket_ = INVALID_SOCKET;
-            return false;
+
+        // Non-blocking connect + select() with a bounded timeout, so a not-
+        // yet-ready board (still booting its network stack) fails fast
+        // instead of stalling the JUCE UI thread on the kernel's default TCP
+        // connect timeout (minutes). The 15 s bound is long enough to cover
+        // the common cases where macOS pauses on first-time ARP resolution
+        // for the board's IP, but short enough that the user isn't sitting
+        // in front of a frozen UI. If a prior attempt POISONED macOS's ARP
+        // cache with a negative entry (clicking CONNECT before the board's
+        // lwIP was up), even a fresh connect from ANY tool -- including
+        // net.py -- will fail with EHOSTUNREACH for ~20 s. Either wait for
+        // the cache to age out or run `sudo arp -d <BOARD_IP>` to clear it.
+        constexpr int CONNECT_TIMEOUT_SEC = 15;
+#ifdef _WIN32
+        u_long nb = 1;
+        ioctlsocket(tcpSocket_, FIONBIO, &nb);
+#else
+        int flags = fcntl(tcpSocket_, F_GETFL, 0);
+        if (flags != -1)
+            fcntl(tcpSocket_, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+        int cr = connect(tcpSocket_,
+                         reinterpret_cast<struct sockaddr*>(&serverAddr),
+                         sizeof(serverAddr));
+        if (cr == SOCKET_ERROR) {
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            const bool pending = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
+#else
+            const int err = errno;
+            const bool pending = (err == EINPROGRESS || err == EWOULDBLOCK);
+#endif
+            if (!pending) {
+                std::cout << "[IntanInterface] connectTcp: connect() failed err="
+                          << err
+#ifndef _WIN32
+                          << " (" << std::strerror(err) << ")"
+                          << (err == EHOSTUNREACH
+                              ? "  -- macOS ARP cache holds a negative entry"
+                                " for this IP. Wait ~20 s or run: sudo arp -d "
+                              : "")
+                          << (err == EHOSTUNREACH ? deviceIp_ : std::string(""))
+#endif
+                          << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
+
+            fd_set wfds, efds;
+            FD_ZERO(&wfds); FD_SET(tcpSocket_, &wfds);
+            FD_ZERO(&efds); FD_SET(tcpSocket_, &efds);
+            struct timeval tvc;
+            tvc.tv_sec  = CONNECT_TIMEOUT_SEC;
+            tvc.tv_usec = 0;
+            int sel = select((int)tcpSocket_ + 1, nullptr, &wfds, &efds, &tvc);
+            if (sel < 0) {
+                std::cout << "[IntanInterface] connectTcp: select() error errno="
+                          << errno << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
+            if (sel == 0) {
+                // Timeout. The board isn't listening yet -- most common cause
+                // is trying to CONNECT before the Zynq's lwIP stack is up
+                // (~5-20 s after boot). Try again in a couple seconds.
+                std::cout << "[IntanInterface] connectTcp: connect timeout after "
+                          << CONNECT_TIMEOUT_SEC << "s to " << deviceIp_
+                          << ":" << tcpPort_
+                          << " (board still booting? retry in a few seconds)"
+                          << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
+
+            // Check SO_ERROR to confirm connect() actually succeeded (select
+            // returns writable on refused connections too).
+            int soerr = 0;
+            socklen_t soerrlen = sizeof(soerr);
+            int goe = getsockopt(tcpSocket_, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char*>(&soerr), &soerrlen);
+            if (goe != 0 || soerr != 0) {
+                std::cout << "[IntanInterface] connectTcp: SO_ERROR="
+                          << soerr
+#ifndef _WIN32
+                          << " (" << std::strerror(soerr) << ")"
+                          << (soerr == EHOSTUNREACH
+                              ? "  -- macOS ARP cache holds a negative entry"
+                                " for this IP. Wait ~20 s or run: sudo arp -d "
+                              : "")
+                          << (soerr == EHOSTUNREACH ? deviceIp_ : std::string(""))
+#endif
+                          << " (getsockopt rc=" << goe << ")" << std::endl;
+                closesocket(tcpSocket_);
+                tcpSocket_ = INVALID_SOCKET;
+                return false;
+            }
         }
+
+        // Restore blocking mode for the rest of the session (send/recv use
+        // SO_SNDTIMEO/SO_RCVTIMEO for their bounds).
+#ifdef _WIN32
+        u_long nb0 = 0;
+        ioctlsocket(tcpSocket_, FIONBIO, &nb0);
+#else
+        if (flags != -1)
+            fcntl(tcpSocket_, F_SETFL, flags);
+#endif
 
         // Bound how long a single command can wait for a response. Without
         // this, recv() blocks indefinitely if the board's TCP stack stalls
@@ -977,8 +1133,19 @@ public:
         closesocket(tempSock);
     }
     
-    void udpListenerThread() {
-        // Create UDP socket
+    // ------------------------------------------------------------------------
+    // UNIFIED UDP listener (ONE socket on udpPort_ = 5000; ALL streams).
+    //
+    // recvThread_ binds the socket with a big SO_RCVBUF and does the absolute
+    // minimum on the hot path -- recvfrom into a ring -- so broadband is NEVER
+    // dropped while a slow downstream consumer is busy (the no-loss drain rule
+    // from CLAUDE.md / docs/unified-packet-format.md, matching net.py's
+    // UnifiedSink._recv_loop). demuxThread_ pops the ring, peeks the common
+    // header's stream_type (word 1, low byte) and routes broadband and LFP to
+    // their handlers, each of which tracks that stream's per-packet SEQ (word 4)
+    // = the loss check. The board sends exactly one packet per datagram.
+    // ------------------------------------------------------------------------
+    void udpRecvThread() {
         udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpSocket_ == INVALID_SOCKET) {
             std::cout << "[IntanInterface] UDP listener: socket() failed" << std::endl;
@@ -996,7 +1163,34 @@ public:
                    reinterpret_cast<char*>(&reuse), sizeof(reuse));
 #endif
 
-        // Bind to UDP port
+        // Big receive buffer so the kernel never drops a datagram while we are
+        // briefly off the socket (matches net.py's 16 MB SO_RCVBUF). The OS may
+        // clamp this to net.core.rmem_max; we log what we actually got.
+        int rcvbuf = 16 * 1024 * 1024;
+        setsockopt(udpSocket_, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<char*>(&rcvbuf), sizeof(rcvbuf));
+        int gotbuf = 0;
+        socklen_t gotlen = sizeof(gotbuf);
+        if (getsockopt(udpSocket_, SOL_SOCKET, SO_RCVBUF,
+                       reinterpret_cast<char*>(&gotbuf), &gotlen) == 0) {
+            // Linux reports double the value it actually reserves.
+            std::cout << "[IntanInterface] UDP SO_RCVBUF = " << (gotbuf / 1024)
+                      << " KB (requested " << (rcvbuf / 1024) << " KB)" << std::endl;
+            // If the OS clamped it well below the request, the kernel drops UDP
+            // under any brief stall -> broadband SEQ gaps that net.py (on a box
+            // with a larger granted buffer) never sees. Surface it loudly with
+            // the exact fix so it isn't silently the cause.
+            if (gotbuf < rcvbuf) {
+                std::cout << "[IntanInterface] WARNING: SO_RCVBUF was CLAMPED to "
+                          << (gotbuf / 1024) << " KB (< requested " << (rcvbuf / 1024)
+                          << " KB). Raise the OS limit to avoid UDP drops under load: "
+                          << "macOS  'sudo sysctl -w kern.ipc.maxsockbuf=33554432' ; "
+                          << "Linux  'sudo sysctl -w net.core.rmem_max=16777216'."
+                          << std::endl;
+            }
+        }
+
+        // Bind to the unified UDP port.
         struct sockaddr_in bindAddr;
         std::memset(&bindAddr, 0, sizeof(bindAddr));
         bindAddr.sin_family = AF_INET;
@@ -1013,137 +1207,174 @@ public:
             return;
         }
 
-        std::cout << "[IntanInterface] UDP listener: bound on port "
-                  << udpPort_ << std::endl;
-        
-        // Set timeout for clean shutdown
+        std::cout << "[IntanInterface] Unified UDP listener bound on port "
+                  << udpPort_ << " (demux by stream_type: broadband + LFP on one port)"
+                  << std::endl;
+
+        // Short timeout so the thread sees running_ == false promptly on stop.
         struct timeval tv;
         tv.tv_sec = 1;
         tv.tv_usec = 0;
         setsockopt(udpSocket_, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<char*>(&tv), sizeof(tv));
-        
-        std::vector<uint8_t> buffer(4096);
+
         startTime_ = std::chrono::steady_clock::now();
-        
+
         while (running_.load()) {
             struct sockaddr_in senderAddr;
             socklen_t senderLen = sizeof(senderAddr);
+            std::vector<uint8_t> buffer(4096);
 
             int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.data()),
-                                   buffer.size(), 0,
-                                   reinterpret_cast<struct sockaddr*>(&senderAddr),
-                                   &senderLen);
-
-            if (received > 0) {
-                processUdpData(buffer.data(), received);
-            }
-        }
-    }
-
-    // LFP UDP listener (fixed port 5001 per the firmware protocol). Always
-    // bound -- silently consumes nothing until the firmware's LFP engine is
-    // enabled. Frame format (24-byte header + payload):
-    //   word 0-1 : magic {0x1F1FBEEF, 0xCAFEBABE}
-    //   word 2-3 : 64-bit timestamp (= frame_seq * decim_R, aligns with broadband)
-    //   word 4   : [7:0] lane_mask | [15:8] decim_R | [23:16] num_taps | [24] overrun
-    //   word 5   : 32-bit frame sequence (drop detection)
-    //   word 6+  : popcount(lane_mask) * 32 offset-binary 16-bit samples,
-    //              packed 2 per 32-bit word; per enabled lane (low->high bit),
-    //              32 amplifier channels each.
-    static constexpr uint32_t LFP_MAGIC_LOW  = 0x1F1FBEEF;
-    static constexpr uint32_t LFP_MAGIC_HIGH = 0xCAFEBABE;
-    static constexpr uint16_t LFP_UDP_PORT_DEFAULT = 5001;
-
-    void lfpListenerThread() {
-        lfpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (lfpSocket_ == INVALID_SOCKET) {
-            std::cout << "[IntanInterface] LFP listener: socket() failed" << std::endl;
-            return;
-        }
-
-        int reuse = 1;
-        setsockopt(lfpSocket_, SOL_SOCKET, SO_REUSEADDR,
-                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
-#ifdef SO_REUSEPORT
-        setsockopt(lfpSocket_, SOL_SOCKET, SO_REUSEPORT,
-                   reinterpret_cast<char*>(&reuse), sizeof(reuse));
-#endif
-
-        struct sockaddr_in bindAddr;
-        std::memset(&bindAddr, 0, sizeof(bindAddr));
-        bindAddr.sin_family = AF_INET;
-        bindAddr.sin_addr.s_addr = INADDR_ANY;
-        bindAddr.sin_port = htons(LFP_UDP_PORT_DEFAULT);
-
-        if (bind(lfpSocket_, reinterpret_cast<struct sockaddr*>(&bindAddr),
-                sizeof(bindAddr)) == SOCKET_ERROR) {
-            std::cout << "[IntanInterface] LFP listener: bind to port "
-                      << LFP_UDP_PORT_DEFAULT << " FAILED (errno="
-                      << errno << ")" << std::endl;
-            closesocket(lfpSocket_);
-            lfpSocket_ = INVALID_SOCKET;
-            return;
-        }
-
-        std::cout << "[IntanInterface] LFP listener: bound on port "
-                  << LFP_UDP_PORT_DEFAULT << std::endl;
-
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        setsockopt(lfpSocket_, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<char*>(&tv), sizeof(tv));
-
-        std::vector<uint8_t> buffer(4096);
-
-        while (running_.load()) {
-            struct sockaddr_in senderAddr;
-            socklen_t senderLen = sizeof(senderAddr);
-            int received = recvfrom(lfpSocket_, reinterpret_cast<char*>(buffer.data()),
                                     buffer.size(), 0,
                                     reinterpret_cast<struct sockaddr*>(&senderAddr),
                                     &senderLen);
-            if (received > 0) {
-                processLfpDatagram(buffer.data(), received);
+
+            if (received <= 0)
+                continue;   // timeout (EAGAIN) or error -> re-check running_
+
+            buffer.resize((size_t)received);
+            {
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                if (ring_.size() >= kRingMax) {
+                    // Host-side ring overflow (NOT a board drop). Surface it as
+                    // a reception error so it's never silently hidden.
+                    ringDrops_++;
+                } else {
+                    ring_.push_back(std::move(buffer));
+                    ringCv_.notify_one();
+                }
             }
         }
     }
 
-    void processLfpDatagram(const uint8_t* data, size_t len) {
-        if (len < 24) return;  // header alone is 24 bytes
+    void udpDemuxThread() {
+        while (running_.load()) {
+            std::vector<uint8_t> datagram;
+            {
+                std::unique_lock<std::mutex> lock(ringMutex_);
+                ringCv_.wait_for(lock, std::chrono::milliseconds(200),
+                                 [this] { return !ring_.empty() || !running_.load(); });
+                if (ring_.empty())
+                    continue;
+                datagram = std::move(ring_.front());
+                ring_.pop_front();
+            }
+            demuxDatagram(datagram.data(), datagram.size());
+        }
+        // Drain anything still queued at shutdown so we don't silently lose it.
+        for (;;) {
+            std::vector<uint8_t> datagram;
+            {
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                if (ring_.empty()) break;
+                datagram = std::move(ring_.front());
+                ring_.pop_front();
+            }
+            demuxDatagram(datagram.data(), datagram.size());
+        }
+    }
 
-        uint32_t magicLo = unpackU32LE(data);
-        uint32_t magicHi = unpackU32LE(data + 4);
-        if (magicLo != LFP_MAGIC_LOW || magicHi != LFP_MAGIC_HIGH) return;
+    // Peek the common header and route by stream_type.
+    void demuxDatagram(const uint8_t* data, size_t len) {
+        if (len < COMMON_HEADER_WORDS * 4)
+            return;                       // shorter than the 32-byte common header
+
+        uint32_t magic   = unpackU32LE(data);          // w0
+        uint32_t typeVer = unpackU32LE(data + 4);       // w1
+        if (magic != UNIFIED_MAGIC) {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            magicErrors_++;
+            totalErrors_++;
+            return;
+        }
+
+        uint8_t streamType = (uint8_t)(typeVer & 0xFF);
+        if (streamType == STREAM_TYPE_BROADBAND) {
+            processBroadbandDatagram(data, len);
+        } else if (streamType == STREAM_TYPE_LFP) {
+            processLfpDatagram(data, len);
+        }
+        // Other stream types (e.g. WAVELET=3) are silently ignored on this
+        // branch -- they belong to the follow-on consumer.
+    }
+
+    // LFP frame (UNIFIED stream_type = 2). The PL builds the whole wire packet
+    // (common header + decimated samples) and the PS just sends it on UDP 5000.
+    // Header layout (docs/unified-packet-format.md, net.py receive_lfp):
+    //   w0 MAGIC=0xCAFEBABE | w1 TYPE_VER (stream_type=2 | version<<8)
+    //   w2/w3 = 64-bit master timestamp (newest input sample of the window)
+    //   w4 = SEQ (PL LFP frame sequence; +1/frame -- the loss check)
+    //   w5 = AUX0 = lane_mask | decim_R<<8 | num_taps<<16 | overrun<<24
+    //   w6 = AUX1 = num_samples (= popcount(lane_mask) * 32)
+    //   w7 = RSVD
+    //   w8.. = popcount(lane_mask)*32 offset-binary 16-bit samples, 2 per word.
+    void processLfpDatagram(const uint8_t* data, size_t len) {
+        static constexpr size_t HDR = COMMON_HEADER_WORDS * 4;  // 32-byte common header
+        if (len < HDR) return;
 
         uint64_t timestamp = (uint64_t)unpackU32LE(data + 8) |
-                             ((uint64_t)unpackU32LE(data + 12) << 32);
-        uint32_t cfg       = unpackU32LE(data + 16);
-        uint32_t frameSeq  = unpackU32LE(data + 20);
+                             ((uint64_t)unpackU32LE(data + 12) << 32);   // w2/w3
+        uint32_t seq       = unpackU32LE(data + 16);   // w4 = per-stream SEQ
+        uint32_t aux0      = unpackU32LE(data + 20);   // w5 = AUX0
+        uint32_t numSamples = unpackU32LE(data + 24);  // w6 = AUX1 = num_samples
 
-        uint8_t laneMask = (uint8_t)(cfg & 0xFF);
-        uint8_t decimR   = (uint8_t)((cfg >> 8) & 0xFF);
-        uint8_t numTaps  = (uint8_t)((cfg >> 16) & 0xFF);
-        bool    overrun  = ((cfg >> 24) & 0x1) != 0;
+        uint8_t laneMask = (uint8_t)(aux0 & 0xFF);
+        uint8_t decimR   = (uint8_t)((aux0 >> 8) & 0xFF);
+        uint8_t numTaps  = (uint8_t)((aux0 >> 16) & 0xFF);
+        bool    overrun  = ((aux0 >> 24) & 0x1) != 0;
 
         // Payload size from the lane mask. Each enabled lane contributes 32
-        // amplifier channels x 1 16-bit sample = 64 bytes per frame.
+        // amplifier channels x 1 16-bit sample = 64 bytes per frame. Cross-check
+        // against the AUX1 num_samples field the firmware sends.
         int popcount = 0;
         for (int b = 0; b < 8; ++b) popcount += ((laneMask >> b) & 1);
         size_t expectedSamples = (size_t)popcount * 32;
+        if (numSamples != 0 && numSamples != expectedSamples)
+            return;                                    // mask/cfg drift -- drop
         size_t expectedBytes   = expectedSamples * sizeof(uint16_t);
-        size_t available       = len - 24;
-        if (available < expectedBytes) return;  // truncated / wrong mask
+        if (len - HDR < expectedBytes) return;         // truncated / wrong mask
 
-        // The payload is little-endian uint16, naturally aligned. recvfrom
-        // hands us a uint8_t buffer; reinterpret as uint16_t* is safe on the
-        // platforms we target.
-        const uint16_t* samples = reinterpret_cast<const uint16_t*>(data + 24);
+        // Per-stream LFP SEQ continuity = the LFP loss check. A gap means the
+        // board emitted frames we never received. Count + log it (never hide).
+        {
+            std::lock_guard<std::mutex> lock(statsMutex_);
+            if (lfpHaveSeq_) {
+                uint32_t expectedSeq = lfpLastSeq_ + 1;  // wraps at 2^32 naturally
+                uint32_t delta = seq - expectedSeq;      // mod 2^32
+                if (delta == 0) {
+                    // Contiguous (including the 32-bit wrap) -- no loss.
+                } else if (delta < 0x80000000u) {
+                    // FORWARD gap => genuinely dropped LFP frame(s). Count always,
+                    // throttle the log (see the broadband path for why).
+                    lfpSeqGaps_++;
+                    lfpLostFrames_ += delta;
+                    static thread_local std::chrono::steady_clock::time_point lastLfpLoss{};
+                    auto nowTp = std::chrono::steady_clock::now();
+                    if (nowTp - lastLfpLoss > std::chrono::seconds(1)) {
+                        lastLfpLoss = nowTp;
+                        std::cout << "[IntanInterface][LOSS] LFP SEQ gap: expected "
+                                  << expectedSeq << ", got " << seq << " (+" << delta
+                                  << " missing). lfp_seq_gaps=" << lfpSeqGaps_
+                                  << " (throttled)" << std::endl;
+                    }
+                } else {
+                    // BACKWARD jump => stream restart (SEQ resets on START); resync
+                    // silently, not archival loss.
+                }
+            }
+            lfpLastSeq_ = seq;
+            lfpHaveSeq_ = true;
+        }
+
+        // The payload is little-endian uint16, naturally aligned (the common
+        // header is a whole number of 32-bit words). recvfrom hands us a
+        // uint8_t buffer; reinterpret as uint16_t* is safe on our platforms.
+        const uint16_t* samples = reinterpret_cast<const uint16_t*>(data + HDR);
 
         LfpFrame frame;
         frame.timestamp     = timestamp;
-        frame.frameSequence = frameSeq;
+        frame.frameSequence = seq;
         frame.laneMask      = laneMask;
         frame.decimR        = decimR;
         frame.numTaps       = numTaps;
@@ -1158,11 +1389,19 @@ public:
         }
         if (cb) cb(frame);
     }
-    
-    void processUdpData(const uint8_t* data, size_t len) {
+
+    // A datagram is exactly one broadband packet (the board sends one packet
+    // per datagram). We still re-chunk defensively in case several were
+    // coalesced (matches net.py UnifiedSink._handle_broadband).
+    void processBroadbandDatagram(const uint8_t* data, size_t len) {
         size_t expectedBytes = expectedPacketSizeWords_ * 4;
-        
-        // Process multiple packets if present
+        if (expectedBytes == 0)
+            return;
+
+        if (len == expectedBytes) {
+            validateAndDispatchPacket(data, expectedBytes);
+            return;
+        }
         for (size_t offset = 0; offset + expectedBytes <= len; offset += expectedBytes) {
             validateAndDispatchPacket(data + offset, expectedBytes);
         }
@@ -1182,32 +1421,74 @@ public:
             return;
         }
         
-        // Unpack as 32-bit words
-        std::vector<uint32_t> words(expectedPacketSizeWords_);
+        // Unpack as 32-bit words. Reuse a per-thread buffer instead of allocating
+        // a fresh vector on every packet: at 30 kHz a per-packet heap alloc here
+        // (plus the ones on the recv + queue paths) churns the global allocator
+        // and its latency drifts up over minutes -> a stall eventually overflows
+        // the socket buffer -> SEQ gap. net.py stays clean by never allocating on
+        // the hot path. This function only ever runs on the demux thread, so a
+        // thread_local buffer is safe. resize() to the same size is a no-op.
+        static thread_local std::vector<uint32_t> words;
+        if (words.size() != expectedPacketSizeWords_)
+            words.resize(expectedPacketSizeWords_);
         for (size_t i = 0; i < expectedPacketSizeWords_; ++i) {
             words[i] = unpackU32LE(&data[i * 4]);
         }
         
-        // Validate magic
-        uint64_t magic = (static_cast<uint64_t>(words[1]) << 32) | words[0];
-        uint64_t expectedMagic = (static_cast<uint64_t>(PACKET_MAGIC_HIGH) << 32) | 
-                                PACKET_MAGIC_LOW;
-        
-        if (magic != expectedMagic) {
+        // UNIFIED header validation: w0 = MAGIC (0xCAFEBABE), w1 low byte =
+        // stream_type (must be BROADBAND here -- the demux already routed by it,
+        // but re-check defensively against a coalesced foreign packet).
+        uint8_t streamType = (uint8_t)(words[1] & 0xFF);
+        if (words[0] != UNIFIED_MAGIC || streamType != STREAM_TYPE_BROADBAND) {
             magicErrors_++;
             totalErrors_++;
             return;
         }
-        
-        // Extract timestamp
+
+        // Extract timestamp (w2/w3) and the per-stream SEQ (w4).
         uint64_t timestamp = (static_cast<uint64_t>(words[3]) << 32) | words[2];
-        
-        // Check for timestamp gaps
-        if (lastTimestamp_ != 0 && timestamp != lastTimestamp_ + 1) {
-            timestampErrors_++;
-            totalErrors_++;
+        uint32_t seq       = words[4];
+
+        // Per-stream SEQ continuity = the BROADBAND loss check (the no-loss
+        // assertion). Each broadband packet's SEQ must be exactly +1 (mod 2^32)
+        // from the previous; a gap means lost broadband packet(s). Broadband is
+        // archival -- surface any gap loudly, never hide it. (Mirrors net.py
+        // DataValidator's SEQ check; replaces the old timestamp-delta heuristic
+        // as the authoritative loss signal.)
+        if (haveSeq_) {
+            uint32_t expectedSeq = lastSeq_ + 1;      // wraps at 2^32 naturally
+            uint32_t delta = seq - expectedSeq;       // mod 2^32
+            if (delta == 0) {
+                // Contiguous (including the natural 32-bit wrap) -- no loss.
+            } else if (delta < 0x80000000u) {
+                // FORWARD gap => genuinely lost broadband packet(s). Always COUNT
+                // it (the counters are the truth), but THROTTLE the log to at most
+                // once/second: printing a blocking std::cout under statsMutex_ on
+                // the demux thread for every gap slows the demux thread, backs up
+                // the ring, and causes MORE drops -> a self-amplifying cascade.
+                seqGaps_++;
+                seqLostPackets_ += delta;
+                timestampErrors_++;   // keep the legacy "loss" counter moving too
+                totalErrors_++;
+                static thread_local std::chrono::steady_clock::time_point lastBbLoss{};
+                auto nowTp = std::chrono::steady_clock::now();
+                if (nowTp - lastBbLoss > std::chrono::seconds(1)) {
+                    lastBbLoss = nowTp;
+                    std::cout << "[IntanInterface][LOSS] Broadband SEQ gap: expected "
+                              << expectedSeq << ", got " << seq << " (+" << delta
+                              << " missing). bb_seq_gaps=" << seqGaps_
+                              << " (throttled)" << std::endl;
+                }
+            } else {
+                // seq < expectedSeq => a BACKWARD jump: the broadband stream
+                // RESTARTED (firmware resets/resyncs the SEQ on START -- e.g. the
+                // 16 START/STOP cycles of cable detection). This is NOT archival
+                // loss; resync silently rather than reporting ~2^32 "missing".
+            }
         }
-        
+        lastSeq_  = seq;
+        haveSeq_  = true;
+
         lastTimestamp_ = timestamp;
         
         // Update stats periodically
@@ -1365,15 +1646,16 @@ public:
         const std::vector<uint32_t>& packet, int stride, int offset,
         const std::string& label, bool verbose) {
 
-        if (packet.size() < PACKET_HEADER_WORDS + 9 * static_cast<size_t>(stride)) {
+        if (packet.size() < CABLE_TEST_DATA_OFFSET_WORDS + 9 * static_cast<size_t>(stride)) {
             return {0.0, ChipType::NONE};
         }
 
         double score = 0.0;
         ChipType chipType = ChipType::NONE;
 
-        // Extract data words (skip header)
-        std::vector<uint32_t> dataWords(packet.begin() + PACKET_HEADER_WORDS, packet.end());
+        // Extract data words from the calibrated cable-test offset (8 words),
+        // matching net.py _score_channel exactly. NOT PACKET_HEADER_WORDS.
+        std::vector<uint32_t> dataWords(packet.begin() + CABLE_TEST_DATA_OFFSET_WORDS, packet.end());
 
         if (dataWords.size() < 35) {
             return {0.0, ChipType::NONE};
@@ -1504,24 +1786,33 @@ public:
     uint16_t tcpPort_;
     uint16_t udpPort_;
     
-    // Sockets
+    // Sockets -- ONE UDP socket now (unified port; LFP socket removed).
     SOCKET tcpSocket_;
     SOCKET udpSocket_;
-    SOCKET lfpSocket_;
-    
-    // Threading
-    std::thread udpThread_;
-    std::thread lfpThread_;
+
+    // Threading: recvThread_ drains the socket -> ring; demuxThread_ routes by
+    // stream_type. (Replaces the old per-stream udpThread_/lfpThread_ pair.)
+    std::thread recvThread_;
+    std::thread demuxThread_;
     std::atomic<bool> running_;
     std::atomic<bool> connected_;
     mutable std::mutex tcpMutex_;
     mutable std::mutex callbackMutex_;
     mutable std::mutex statsMutex_;
-    
+
+    // Promiscuous-drain ring between recvThread_ and demuxThread_. Big enough
+    // to ride out a long downstream stall without dropping a datagram; an
+    // overflow is counted (ringDrops_) and surfaced, never silently hidden.
+    static constexpr size_t kRingMax = 200000;
+    std::deque<std::vector<uint8_t>> ring_;
+    std::mutex ringMutex_;
+    std::condition_variable ringCv_;
+    uint64_t ringDrops_ = 0;
+
     // State
     uint8_t currentChannelEnable_;
     size_t expectedPacketSizeWords_;
-    
+
     // Statistics
     uint64_t totalPackets_;
     uint64_t totalErrors_;
@@ -1532,6 +1823,17 @@ public:
     std::chrono::steady_clock::time_point startTime_;
     std::chrono::steady_clock::time_point lastStatsTime_;
     uint64_t lastPacketCount_;
+
+    // Per-stream SEQ loss tracking (the no-loss assertion; header word 4).
+    // Broadband must stay at zero gaps; LFP gaps are logged independently.
+    bool     haveSeq_        = false;
+    uint32_t lastSeq_        = 0;
+    uint64_t seqGaps_        = 0;   // broadband gap events
+    uint64_t seqLostPackets_ = 0;   // total broadband packets implied missing
+    bool     lfpHaveSeq_     = false;
+    uint32_t lfpLastSeq_     = 0;
+    uint64_t lfpSeqGaps_     = 0;   // LFP gap events
+    uint64_t lfpLostFrames_  = 0;   // total LFP frames implied missing
     
     // Callbacks
     DataCallback dataCallback_;
@@ -1676,37 +1978,92 @@ bool IntanInterface::lfpUploadCoefs(const std::vector<int32_t>& coefs) {
     return pImpl_->lfpUploadCoefs(coefs);
 }
 
-// Windowed-sinc (Hamming) low-pass FIR, unity DC gain, quantized to Q1.17
-// signed. Exact port of remote/net.py design_lfp_lowpass() so the plugin
-// and net.py produce bit-identical kernels at the same params.
-std::vector<int32_t> IntanInterface::lfpDesignLowpass(int numTaps,
-                                                     double cutoffHz,
-                                                     double fs) {
-    const double fc = cutoffHz / fs;           // normalised cutoff (cycles/sample)
-    const double M  = numTaps - 1.0;
-    std::vector<double> h(numTaps);
-    for (int n = 0; n < numTaps; ++n) {
-        double x = (double)n - M / 2.0;
-        double s;
-        if (std::fabs(x) < 1e-9) {
-            s = 2.0 * fc;                       // sinc at zero
-        } else {
-            s = std::sin(2.0 * M_PI * fc * x) / (M_PI * x);
+namespace {
+// Kaiser window via the I0 Bessel series (no external dependency). Exact port
+// of remote/net.py _kaiser_window() so lfpDesignCicCompFir stays bit-identical
+// to net.py at the same params.
+std::vector<double> kaiserWindow(int numTaps, double beta) {
+    auto i0 = [](double x) {
+        double s = 1.0, t = 1.0;
+        for (int k = 1; k < 200; ++k) {
+            t *= (x * x) / (4.0 * k * k);
+            s += t;
+            if (t < 1e-12 * s) break;
         }
-        double w = 0.54 - 0.46 * std::cos(2.0 * M_PI * (double)n / M);  // Hamming
-        h[n] = s * w;
+        return s;
+    };
+    const double a = (numTaps - 1) / 2.0;
+    const double denom = i0(beta);
+    std::vector<double> w(numTaps);
+    for (int n = 0; n < numTaps; ++n) {
+        const double u = (n - a) / a;
+        const double arg = beta * std::sqrt(std::max(0.0, 1.0 - u * u));
+        w[n] = i0(arg) / denom;
     }
-    double g = 0.0;
-    for (double v : h) g += v;
-    if (g == 0.0) g = 1.0;
+    return w;
+}
+} // namespace
 
-    const int32_t scale = 1 << LfpDefaults::COEF_FRAC;   // 1<<17
-    const int32_t lim   = 1 << LfpDefaults::COEF_FRAC;   // also 1<<17 (clamp limit)
+// Droop-compensated comp-FIR halfband for the shipped USE_CIC=1 datapath
+// (CIC^4(/5) -> FIR(/2) = /10). Frequency-sampling design at the CIC output
+// rate fs_in/R_cic (6 kHz) with target = 1/CIC-droop, unity DC gain, Kaiser
+// window, quantized to Q1.17. Exact port of remote/net.py design_cic_comp_fir()
+// so the plugin and net.py upload bit-identical kernels.
+std::vector<int32_t> IntanInterface::lfpDesignCicCompFir(int numTaps, double fc,
+                                                        double beta, int R_cic,
+                                                        int nOrder, int gainShift,
+                                                        double fsIn) {
+    const double fs1 = fsIn / (double)R_cic;    // comp-FIR input rate (6 kHz)
+
+    auto cicMag = [&](double f) {
+        const double w = M_PI * f / fsIn;
+        if (std::fabs(w) < 1e-12) return 1.0;
+        const double d = (double)R_cic * std::sin(w);
+        if (std::fabs(d) < 1e-15) return 1.0;
+        const double r = std::sin((double)R_cic * w) / d;
+        double acc = 1.0;
+        for (int k = 0; k < nOrder; ++k) acc *= r;
+        return acc;
+    };
+
+    const double cicDc = std::pow((double)R_cic, (double)nOrder)
+                       / (double)(1 << gainShift);
+
+    const auto win = kaiserWindow(numTaps, beta);
+    const double M = numTaps - 1.0;
+    const double a = M / 2.0;
+
+    auto desired = [&](double f) {
+        if (f > fc) return 0.0;
+        const double dr = cicMag(f);
+        return (dr > 1e-6) ? (1.0 / dr) : 1.0;
+    };
+
+    const int L = 2048;
+    std::vector<double> h(numTaps, 0.0);
+    const double df = (fs1 / 2.0) / (double)L;
+    for (int n = 0; n < numTaps; ++n) {
+        double acc = 0.0;
+        for (int k = 0; k <= L; ++k) {
+            const double f = df * (double)k;
+            const double wgt = (k == 0 || k == L) ? 0.5 : 1.0;
+            acc += wgt * desired(f) * std::cos(2.0 * M_PI * f * ((double)n - a) / fs1);
+        }
+        h[n] = acc * df * 2.0 / (fs1 / 2.0) * win[n];
+    }
+
+    double dc = 0.0;
+    for (double v : h) dc += v;
+    if (dc == 0.0) dc = 1.0;
+    const double normGain = (1.0 / cicDc) / dc;
+    for (double& v : h) v *= normGain;
+
+    const int32_t scale = 1 << LfpDefaults::COEF_FRAC;
+    const int32_t lim   = 1 << LfpDefaults::COEF_FRAC;
     std::vector<int32_t> coefs(numTaps);
     for (int n = 0; n < numTaps; ++n) {
-        double normalised = h[n] / g * (double)scale;
-        long long q = (long long)std::llround(normalised);
-        if (q >  lim - 1) q = lim - 1;
+        long long q = (long long)std::llround(h[n] * (double)scale);
+        if (q >  lim - 1) q =  lim - 1;
         if (q < -lim)     q = -lim;
         coefs[n] = (int32_t)q;
     }
@@ -1768,12 +2125,14 @@ uint32_t IntanInterface::calculatePacketSize(uint8_t channelMask) {
     }
     
     if (numChannels == 0) {
-        return 80; // Default to maximum
+        // Mask 0 -> 70 data words (matches net.py calculate_data_words), so the
+        // 14-word unified header gives 84 words total.
+        return PACKET_HEADER_WORDS + 70;
     }
-    
+
     uint32_t total16bitWords = 35 * numChannels;
     uint32_t data32bitWords = (total16bitWords + 1) / 2;
-    
+
     return PACKET_HEADER_WORDS + data32bitWords;
 }
 

@@ -223,10 +223,50 @@ bool IntanSocket::connectDevice(bool printOutput)
         // Aux sequencer state (already persisted across reconnect)
         auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
 
-        // LFP/DSP engine state -- mirror from device. If LFP is enabled in
-        // the firmware (configured + started via the external tool), we'll
-        // publish a SECOND DataStream in updateSettings sized for the active
-        // lane mask + decimation rate. If disabled, no LFP stream.
+        // LFP/DSP engine state -- mirror from device. If the firmware retains
+        // an LFP config from a previous session, adopt it -- UNLESS it's
+        // incompatible with the shipped USE_CIC=1 PL (decim_R != 10 or
+        // num_taps > 64, which silently wraps HB_TAPN_W=7 and scrambles the
+        // halfband filter). In the incompatible case the engine emits 1 valid
+        // frame per ~136 and the host sees 135-per-1 SEQ gaps; the previous
+        // plugin build shipped a buggy default (decim_R=15 / num_taps=128)
+        // that leaves this exact state stuck in firmware until reboot. Force-
+        // reapply the CIC defaults here so the plugin's internal state and
+        // the firmware always agree AND the stream is actually clean.
+        {
+            using D = IntanInterface::LfpDefaults;
+            // Only reconfigure if the engine is actually going to emit
+            // (lfpEnabled) AND its config can't produce sensible data:
+            //   decim_R != 10   -> mismatches the hardwired CIC /10 chain
+            //   num_taps == 0   -> halfband RAM is unloaded; garbage output
+            //   num_taps > 64   -> HB_TAPN_W=7 overflow; scrambled halfband
+            // A sensible custom config from net.py (decim_R=10, 0<taps<=64)
+            // is left alone.
+            const bool cicIncompatible = status.hasLfpStatus
+                && status.lfpEnabled
+                && (status.lfpDecimR != D::DECIM_R
+                    || status.lfpNumTaps == 0
+                    || status.lfpNumTaps > 64);
+            if (cicIncompatible)
+            {
+                LOGC("LFP: firmware config (decim=", (int)status.lfpDecimR,
+                     " taps=", (int)status.lfpNumTaps,
+                     ") not CIC-compatible -- reapplying defaults at connect");
+                if (configureLfpDefaults()
+                    && intanInterface->lfpEnable(true)
+                    && intanInterface->getStatus(status))
+                {
+                    // status is now refreshed; fall through to the mirror block
+                }
+                else
+                {
+                    LOGE("LFP: reconfigure at connect failed -- disabling LFP");
+                    intanInterface->lfpEnable(false);
+                    status.lfpEnabled = false;
+                }
+            }
+        }
+
         if (status.hasLfpStatus && status.lfpEnabled
             && status.lfpLaneMask != 0 && status.lfpDecimR != 0)
         {
@@ -648,12 +688,20 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
     // Queue the packet for processing in updateBuffer()
     
     std::lock_guard<std::mutex> lock(queueMutex);
-    
+
+    if (dataQueue.size() >= kMaxDataQueue) {
+        // Consumer fell behind -> drop the OLDEST and count it, rather than grow
+        // the queue without bound (see kMaxDataQueue note). A counted, bounded
+        // drop here is far better than the uncounted allocator-stall spiral.
+        dataQueue.pop();
+        dataQueueDrops_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     DataPacket packet;
     packet.data.assign(data, data + wordCount);
     packet.timestamp = timestamp;
-    
-    dataQueue.push(packet);
+
+    dataQueue.push(std::move(packet));   // move, not copy
 }
 
 void IntanSocket::processLfpFrame(const IntanInterface::LfpFrame& frame)
@@ -700,16 +748,22 @@ bool IntanSocket::updateBuffer()
         std::lock_guard<std::mutex> lock(queueMutex);
         if (dataQueue.empty())
             return true;
-        
-        packet = dataQueue.front();
+
+        packet = std::move(dataQueue.front());   // move out, no copy
         dataQueue.pop();
     }
 
+    // UNIFIED broadband header: 8-word common header + 6-word sub-block = 14
+    // header words ahead of the data (docs/unified-packet-format.md). Timestamp
+    // is the common header's w2/w3 (unchanged offset).
+    static constexpr size_t kBroadbandHeaderWords = 14;
+
     int64 timestamp = (static_cast<uint64_t>(packet.data.data()[3]) << 32) | packet.data.data()[2];
 
-    // Skip header (first 10 words: magic + timestamp)
-    const uint32_t* dataWords = packet.data.data() + 10;
-    size_t numDataWords = packet.data.size() - 10;
+    // Skip the full 14-word unified broadband header; the data words that
+    // follow are byte-identical to the legacy stream.
+    const uint32_t* dataWords = packet.data.data() + kBroadbandHeaderWords;
+    size_t numDataWords = packet.data.size() - kBroadbandHeaderWords;
 
     // (Per-second PACKET DEBUG dump removed -- it was log spam; totalSamples
     // is still incremented at the end of this function as a sample counter,
@@ -829,11 +883,17 @@ bool IntanSocket::updateBuffer()
     //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's
     //    housekeeping result -- neither is accelerometer data in this mode.)
     //
-    // Port B uses the SAME header echo (words 4/5) as port A.
+    // UNIFIED header field mapping (docs/unified-packet-format.md, net.py
+    // print_aux_info):
+    //   AUX1 = common-header word 6 = {echo0[31:16], aux_flags[15:8], digital_in[7:0]}
+    //   sub-block word 8           = {echo_slot2_prev[31:16], echo_slot1_prev[15:0]}
+    // The slot-1 accelerometer command echo that drives the de-interleave is in
+    // the LOW 16 bits of word 8 (was word 5 in the legacy 10-word header).
+    // Port B uses the SAME header echo as port A.
     {
-        uint32_t hdr4 = packet.data.data()[4];
-        uint32_t hdr5 = packet.data.data()[5];
-        uint8_t auxFlags = (hdr4 >> 8) & 0xFF;
+        uint32_t auxWord  = packet.data.data()[6];   // AUX1 (flags + digital_in + echo0)
+        uint32_t echoWord = packet.data.data()[8];   // sub-block: prev slot-1/2 echoes
+        uint8_t auxFlags = (auxWord >> 8) & 0xFF;
         bool seqActive = (auxFlags & 0x01) != 0;
         bool echoValid = (auxFlags & 0x10) != 0;
 
@@ -863,7 +923,7 @@ bool IntanSocket::updateBuffer()
         }
         else
         {
-            uint16_t echo1 = hdr5 & 0xFFFF;          // slot-1 cmd answered @ cycle 0
+            uint16_t echo1 = echoWord & 0xFFFF;      // slot-1 cmd answered @ cycle 0
             bool isConvert = (echo1 & 0xC000) == 0;
             int convCh = (echo1 >> 8) & 0x3F;
 
@@ -887,8 +947,8 @@ bool IntanSocket::updateBuffer()
     for (; outCh < num_channels; ++outCh)
         convbuf[outCh] = 0.0f;
     
-    uint64 ttlEventWord = (static_cast<uint64_t>(packet.data.data()[5]) << 32) | packet.data.data()[4];
-    ttlEventWord = ttlEventWord & 0x00000000000000FF; // digital input is least significant 8 bits
+    // digital_in[7:0] now lives in the LOW byte of AUX1 (common header word 6).
+    uint64 ttlEventWord = packet.data.data()[6] & 0xFFu; // digital input = low 8 bits of AUX1
 
 
     double ts;
@@ -1322,21 +1382,23 @@ bool IntanSocket::configureLfpDefaults()
     }
     using D = IntanInterface::LfpDefaults;
 
-    // Mirror remote/net.py configure_lfp() ordering: disable, set channels,
-    // set params, design + upload coefficients. Caller enables afterwards.
+    // Mirror remote/net.py configure_lfp("cic") ordering: disable, set channels,
+    // set params, design + upload the CIC-droop-compensated comp-FIR halfband
+    // kernel. Caller enables afterwards. This matches the shipped USE_CIC=1
+    // PL (CIC^4(/5) -> FIR(/2) = /10 -> 3 kHz LFP); a plain lowpass at
+    // decim_R=15 does NOT match this datapath.
     if (!intanInterface->lfpEnable(false))             return false;
     if (!intanInterface->lfpSetChannels(D::LANE_MASK)) return false;
     if (!intanInterface->lfpSetParams(D::DECIM_R, D::NUM_TAPS)) return false;
 
-    auto coefs = IntanInterface::lfpDesignLowpass(D::NUM_TAPS, D::CUTOFF_HZ, D::FS);
+    auto coefs = IntanInterface::lfpDesignCicCompFir();   // uses LfpDefaults
     if ((int)coefs.size() != D::NUM_TAPS)              return false;
     if (!intanInterface->lfpUploadCoefs(coefs))        return false;
 
-    LOGC("LFP defaults applied: lane=0x", String::toHexString((int)D::LANE_MASK),
-         " decim=", (int)D::DECIM_R,
+    LOGC("LFP defaults applied (CIC comp-FIR): decim=", (int)D::DECIM_R,
          " (", (int)(D::FS / D::DECIM_R), " Hz)",
          " taps=", (int)D::NUM_TAPS,
-         " cutoff=", (int)D::CUTOFF_HZ, " Hz");
+         " fc=", (int)D::CUTOFF_HZ, " Hz");
     return true;
 }
 
@@ -1367,15 +1429,17 @@ bool IntanSocket::setLfpEnabled(bool enable)
             CoreServices::sendStatusMessage("Intan: firmware lacks LFP engine");
             return false;
         }
-        if (s.lfpLaneMask == 0 || s.lfpDecimR == 0)
+        // Always reapply the defaults on enable -- matches net.py's flow
+        // (configure_lfp("cic") before lfp_enable). This is the "just make
+        // it work" affordance: even if firmware's cached decim_R/num_taps
+        // happen to match the defaults, num_taps=0 (fresh boot) or a stale
+        // coefficient RAM will silently produce broken data. Users who want
+        // a custom filter push it via remote/net.py AFTER the button is on.
+        if (!configureLfpDefaults())
         {
-            LOGC("LFP: no firmware config yet -- applying net.py defaults");
-            if (!configureLfpDefaults())
-            {
-                LOGE("LFP: default configure failed");
-                CoreServices::sendStatusMessage("Intan: LFP configure failed");
-                return false;
-            }
+            LOGE("LFP: default configure failed");
+            CoreServices::sendStatusMessage("Intan: LFP configure failed");
+            return false;
         }
     }
 

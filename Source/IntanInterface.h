@@ -135,8 +135,8 @@ public:
         uint8_t rhdReg[22];
 
         // LFP/DSP engine config + status (firmware 0e99881+, status == 160).
-        // The engine emits a SEPARATE UDP stream on port 5001 (broadband on
-        // 5000 is untouched). Decimated samples = popcount(lane_mask) x 32
+        // The engine emits LFP frames on the UNIFIED UDP port (default 5000),
+        // tagged stream_type = 2. Decimated samples = popcount(lane_mask) x 32
         // amplifier channels per frame, at 30000/decim_R Hz. Configure with
         // CMD_LFP_SET_CHANNELS / CMD_LFP_SET_PARAMS / CMD_LFP_WRITE_COEF,
         // then CMD_LFP_ENABLE 1. hasLfpStatus is false on older firmware.
@@ -257,11 +257,12 @@ public:
     using DataCallback = std::function<void(const uint32_t* data, size_t wordCount, uint64_t timestamp)>;
 
     /**
-     * @brief LFP frame metadata (decoded once per UDP packet on port 5001).
+     * @brief LFP frame metadata (decoded once per LFP datagram on the UNIFIED
+     * UDP port, demuxed by stream_type = 2; see docs/unified-packet-format.md).
      */
     struct LfpFrame {
-        uint64_t timestamp;        // frame_seq * decim_R (aligns with broadband ts)
-        uint32_t frameSequence;    // monotonic LFP frame counter (for drop detection)
+        uint64_t timestamp;        // master ts of the newest input sample of the window
+        uint32_t frameSequence;    // per-stream LFP SEQ (header w4; for drop detection)
         uint8_t  laneMask;         // streams whose 32 amp channels are in this frame
         uint8_t  decimR;
         uint8_t  numTaps;
@@ -272,8 +273,8 @@ public:
     };
 
     /**
-     * @brief Callback type for receiving an LFP frame (UDP port 5001).
-     * Invoked from the LFP listener thread.
+     * @brief Callback type for receiving an LFP frame (UNIFIED UDP port,
+     * stream_type = 2). Invoked from the demux thread.
      */
     using LfpDataCallback = std::function<void(const LfpFrame&)>;
 
@@ -609,12 +610,13 @@ public:
     bool readRegister(uint8_t reg, uint16_t& cipo0Value, uint16_t& cipo1Value);
 
     // ========================================================================
-    // LFP / DSP ENGINE (firmware >= 1.2; second UDP stream on port 5001)
+    // LFP / DSP ENGINE (firmware >= 1.2; UNIFIED port, stream_type = 2)
     // ========================================================================
     //
     // The engine LP-filters and decimates the amplifier streams (the same 8
-    // bit lanes as the broadband stream), emitting a parallel UDP datagram
-    // per output frame on port 5001 -- broadband on 5000 is untouched.
+    // bit lanes as the broadband stream), emitting a parallel UDP datagram per
+    // output frame on the SAME port as broadband (default 5000), tagged
+    // stream_type = 2 in the common header and demuxed host-side.
     //
     // Configure order: lfpEnable(false) -> lfpSetChannels(mask)
     //   -> lfpSetParams(decim_R, num_taps) -> lfpUploadCoefs(coefs)
@@ -637,36 +639,35 @@ public:
     /** Convenience: upload a full coefficient set in order (first call clears). */
     bool lfpUploadCoefs(const std::vector<int32_t>& coefs);
 
-    /** Default LFP-engine parameters (mirror remote/net.py configure_lfp).
-     *
-     *  NOTE: these are only the *defaults* the plugin pushes when the firmware
-     *  LFP engine has never been configured since boot. The published
-     *  DataStream rate and timestamp alignment are always DERIVED from the
-     *  decim_R field carried in each LFP UDP packet (see processLfpDatagram /
-     *  DeviceStatus.lfpDecimR -> IntanSocket::lfp_decim_R), so the plugin
-     *  auto-tracks whatever rate the firmware actually runs. Changing DECIM_R
-     *  here only changes what default the plugin configures, not what it can
-     *  receive.
-     *
-     *  CUTOFF_HZ must stay below the output Nyquist = FS / (2 * DECIM_R):
-     *    R=15 -> 1000 Hz Nyquist,  R=10 -> 1500 Hz Nyquist.
-     *  600 Hz is valid for both, so the FIR coefficient set is unchanged.
-     */
+    /** Default LFP-engine parameters, matching remote/net.py configure_lfp
+     *  and the PL's LFP datapath: CIC^4(/5) -> comp-FIR halfband(/2) = /10,
+     *  hardwired -> 3 kHz output. num_taps drives the halfband filter and
+     *  must be <= HB_RING = 64; 43 matches net.py. */
     struct LfpDefaults {
-        static constexpr uint8_t LANE_MASK = 0x0F;     // port A, all 4 streams
-        static constexpr uint8_t DECIM_R   = 10;       // 30000 / 10 = 3000 Hz (was 15 -> 2000 Hz)
-        static constexpr uint8_t NUM_TAPS  = 128;
-        static constexpr double  CUTOFF_HZ = 600.0;    // < FS/(2*DECIM_R) = 1500 Hz @ R=10
-        static constexpr double  FS        = 30000.0;
-        static constexpr int     COEF_FRAC = 17;       // Q1.17
+        static constexpr uint8_t LANE_MASK      = 0x0F;   // legacy; PL ignores (mirrors broadband)
+        static constexpr uint8_t DECIM_R        = 10;     // CIC hardwired /10 -> 3 kHz
+        static constexpr uint8_t NUM_TAPS       = 43;     // halfband comp-FIR (<= HB_RING=64)
+        static constexpr double  CUTOFF_HZ      = 1300.0; // comp-FIR fc (CIC-droop target)
+        static constexpr double  KAISER_BETA    = 6.0;
+        static constexpr int     CIC_R          = 5;
+        static constexpr int     CIC_ORDER      = 4;
+        static constexpr int     CIC_GAIN_SHIFT = 10;
+        static constexpr double  FS             = 30000.0;
+        static constexpr int     COEF_FRAC      = 17;     // Q1.17
     };
 
-    /** Design a windowed-sinc (Hamming) low-pass FIR with unity DC gain,
-     *  quantized to Q1.17 signed (18-bit). Exactly mirrors net.py's
-     *  design_lfp_lowpass(); use for the default configure path. */
-    static std::vector<int32_t> lfpDesignLowpass(int numTaps,
-                                                 double cutoffHz,
-                                                 double fs = LfpDefaults::FS);
+    /** Design the droop-compensated comp-FIR halfband kernel for the PL's
+     *  CIC^4(/5) -> FIR(/2) datapath. Kaiser-windowed frequency-sampling
+     *  design at the CIC output rate fs_in/R_cic (6 kHz), target = 1/CIC-droop,
+     *  unity DC gain, Q1.17 signed. Exact port of net.py's design_cic_comp_fir. */
+    static std::vector<int32_t> lfpDesignCicCompFir(
+        int numTaps    = LfpDefaults::NUM_TAPS,
+        double fc      = LfpDefaults::CUTOFF_HZ,
+        double beta    = LfpDefaults::KAISER_BETA,
+        int R_cic      = LfpDefaults::CIC_R,
+        int nOrder     = LfpDefaults::CIC_ORDER,
+        int gainShift  = LfpDefaults::CIC_GAIN_SHIFT,
+        double fsIn    = LfpDefaults::FS);
 
     // ========================================================================
     // CALLBACKS
@@ -684,9 +685,9 @@ public:
     void setDataCallback(DataCallback callback);
 
     /**
-     * @brief Register callback for LFP frames (UDP port 5001).
+     * @brief Register callback for LFP frames (UNIFIED port, stream_type = 2).
      *
-     * Invoked from the LFP listener thread for every well-formed frame.
+     * Invoked from the demux thread for every well-formed frame.
      * The pointer / count in LfpFrame are valid only for the duration of
      * the callback; copy what you need.
      */
@@ -708,9 +709,9 @@ public:
     /**
      * @brief Get the expected packet size in words
      * 
-     * Packet size depends on channel enable setting:
-     * - Header: 10 words (magic + timestamp + digital + 2x analog)
-     * - Data: variable based on enabled channels
+     * Packet size depends on channel enable setting (UNIFIED broadband format):
+     * - Header: 14 words (8-word common header + 6-word broadband sub-block)
+     * - Data: variable based on enabled channels (byte-identical to legacy)
      * 
      * @param channelMask Channel enable mask (0x0-0xF)
      * @return Expected packet size in 32-bit words
