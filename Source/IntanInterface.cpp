@@ -13,12 +13,14 @@
 #include <condition_variable>
 #include <cerrno>
 #include <array>
+#include <algorithm>
 #include <cmath>
 
 // Platform-specific networking
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #define NOMINMAX // Prevents Windows.h from defining min/max macros
     #pragma comment(lib, "ws2_32.lib")
     using socklen_t = int;
 #else
@@ -31,6 +33,10 @@
     #define SOCKET_ERROR -1
     #define closesocket close
     using SOCKET = int;
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 // ============================================================================
@@ -1997,7 +2003,7 @@ std::vector<double> kaiserWindow(int numTaps, double beta) {
     std::vector<double> w(numTaps);
     for (int n = 0; n < numTaps; ++n) {
         const double u = (n - a) / a;
-        const double arg = beta * std::sqrt(std::max(0.0, 1.0 - u * u));
+        const double arg = beta * std::sqrt(std::max<double>(0.0, 1.0 - u * u));
         w[n] = i0(arg) / denom;
     }
     return w;
@@ -2335,4 +2341,3 @@ std::string IntanInterface::AutoDetectionResult::getChannelSummary() const {
     }
     return oss.str();
 }
-
