@@ -27,6 +27,11 @@
     #include <arpa/inet.h>
     #include <unistd.h>
     #include <fcntl.h>
+    #include <pthread.h>       // recv-thread scheduling priority
+    #include <sched.h>
+    #ifdef __APPLE__
+        #include <pthread/qos.h>
+    #endif
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR -1
     #define closesocket close
@@ -1145,7 +1150,32 @@ public:
     // their handlers, each of which tracks that stream's per-packet SEQ (word 4)
     // = the loss check. The board sends exactly one packet per datagram.
     // ------------------------------------------------------------------------
+
+    // Raise the calling thread's scheduling priority so the OS keeps it running
+    // even when the machine is saturated (OpenEphys at ~300% CPU while the user
+    // adds GUI events). BOTH the recv and demux threads call this: the recv thread
+    // drains the socket, but the DEMUX thread does the real per-packet work (unpack
+    // + SEQ + route at ~28k pkts/s), so if demux is left at normal priority it gets
+    // starved, the recv->demux ring overflows, and packets are dropped -> exactly
+    // the host-side SEQ gaps seen in OpenEphys but never in net.py. Best-effort:
+    // privileged RT classes fall back gracefully if not permitted.
+    static void raiseThreadPriority() {
+#if defined(__APPLE__)
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#elif defined(__linux__)
+        struct sched_param sp; std::memset(&sp, 0, sizeof(sp));
+        sp.sched_priority = sched_get_priority_min(SCHED_FIFO) + 1;
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   // needs privilege; ignored otherwise
+#endif
+    }
+
     void udpRecvThread() {
+        // Give the receive thread HIGH scheduling priority so it keeps draining the
+        // socket even when the machine is saturated (e.g. an OpenEphys GUI event
+        // storm at ~300% CPU). See raiseThreadPriority(). BOTH the recv and demux
+        // threads need this -- if EITHER starves, the recv->demux ring backs up and
+        // we drop (a host-side broadband/LFP SEQ gap that net.py never shows).
+        raiseThreadPriority();
         udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpSocket_ == INVALID_SOCKET) {
             std::cout << "[IntanInterface] UDP listener: socket() failed" << std::endl;
@@ -1223,15 +1253,30 @@ public:
         while (running_.load()) {
             struct sockaddr_in senderAddr;
             socklen_t senderLen = sizeof(senderAddr);
-            std::vector<uint8_t> buffer(4096);
+
+            // Reuse a recycled buffer instead of allocating one per packet.
+            std::vector<uint8_t> buffer;
+            {
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                if (!recvFreeList_.empty()) {
+                    buffer = std::move(recvFreeList_.back());
+                    recvFreeList_.pop_back();
+                }
+            }
+            buffer.resize(4096);   // reuses capacity when recycled -> no realloc
 
             int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.data()),
                                     buffer.size(), 0,
                                     reinterpret_cast<struct sockaddr*>(&senderAddr),
                                     &senderLen);
 
-            if (received <= 0)
-                continue;   // timeout (EAGAIN) or error -> re-check running_
+            if (received <= 0) {
+                // timeout (EAGAIN) or error -> recycle the unused buffer, re-check running_
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                if (recvFreeList_.size() < kFreeListMax)
+                    recvFreeList_.push_back(std::move(buffer));
+                continue;
+            }
 
             buffer.resize((size_t)received);
             {
@@ -1240,6 +1285,8 @@ public:
                     // Host-side ring overflow (NOT a board drop). Surface it as
                     // a reception error so it's never silently hidden.
                     ringDrops_++;
+                    if (recvFreeList_.size() < kFreeListMax)
+                        recvFreeList_.push_back(std::move(buffer));   // recycle on overflow
                 } else {
                     ring_.push_back(std::move(buffer));
                     ringCv_.notify_one();
@@ -1249,6 +1296,11 @@ public:
     }
 
     void udpDemuxThread() {
+        // HIGH priority too -- the demux thread is the real per-packet worker and,
+        // if starved under OpenEphys CPU load, the ring overflows -> SEQ gaps.
+        raiseThreadPriority();
+        auto lastDropLog = std::chrono::steady_clock::now();
+        uint64_t lastRingDrops = 0;
         while (running_.load()) {
             std::vector<uint8_t> datagram;
             {
@@ -1261,6 +1313,33 @@ public:
                 ring_.pop_front();
             }
             demuxDatagram(datagram.data(), datagram.size());
+            // Surface ring overflow so the drop STAGE is visible: ringDrops_ climbing
+            // == recv->demux ring overflowed == the demux thread couldn't keep up
+            // (the SEQ-gap cause). If SEQ gaps appear but ringDrops_ stays flat, the
+            // loss is downstream (IntanSocket dataQueueDrops_ / OE sourceBuffer).
+            {
+                auto now = std::chrono::steady_clock::now();
+                if (now - lastDropLog > std::chrono::seconds(5)) {
+                    lastDropLog = now;
+                    uint64_t rd, ringSz;
+                    { std::lock_guard<std::mutex> lock(ringMutex_);
+                      rd = ringDrops_; ringSz = ring_.size(); }
+                    if (rd != lastRingDrops) {
+                        std::cout << "[IntanInterface][DROP] recv->demux ring overflow: "
+                                  << "ringDrops=" << rd << " (+" << (rd - lastRingDrops)
+                                  << "/5s), ring depth=" << ringSz << "/" << kRingMax
+                                  << " -- demux starved; SEQ gaps originate HERE" << std::endl;
+                        lastRingDrops = rd;
+                    }
+                }
+            }
+            {
+                // Return the buffer to the free-list so the recv thread can reuse
+                // it without a malloc (keeps the hot recv path allocation-free).
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                if (recvFreeList_.size() < kFreeListMax)
+                    recvFreeList_.push_back(std::move(datagram));
+            }
         }
         // Drain anything still queued at shutdown so we don't silently lose it.
         for (;;) {
@@ -1808,6 +1887,12 @@ public:
     std::mutex ringMutex_;
     std::condition_variable ringCv_;
     uint64_t ringDrops_ = 0;
+    // Recycled recv buffers so the hot recv path never mallocs per packet (30k/s
+    // under load add latency + heap fragmentation, slowing the drain right when it
+    // matters). demuxThread_ returns each consumed buffer here; recvThread_ reuses
+    // it. Guarded by ringMutex_; capped so it can't grow with the ring.
+    static constexpr size_t kFreeListMax = 1024;   // ~4 MB of recycled 4 KB buffers
+    std::deque<std::vector<uint8_t>> recvFreeList_;
 
     // State
     uint8_t currentChannelEnable_;
