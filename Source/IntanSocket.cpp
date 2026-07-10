@@ -741,7 +741,33 @@ bool IntanSocket::updateBuffer()
     {
         return false;
     }
-    
+
+    // Periodic visibility into the DOWNSTREAM (post-SEQ-check) drop stage. If
+    // dataQueueDrops_ climbs, OpenEphys's own consumer (this DataThread ->
+    // sourceBuffer -> processing graph/rendering) can't keep up at ~28k pkts/s.
+    // That loss is SILENT -- it happens AFTER the demux SEQ check, so it does NOT
+    // appear as a SEQ gap. Together with the [IntanInterface][DROP] ring log this
+    // pins the stage: ringDrops => demux starved (upstream); dataQueueDrops => OE
+    // too slow (here). If BOTH are flat but OE still loses, it's the OE sourceBuffer.
+    {
+        static auto lastLog = std::chrono::steady_clock::now();
+        static uint64_t lastDrops = 0;
+        auto now = std::chrono::steady_clock::now();
+        if (now - lastLog > std::chrono::seconds(5)) {
+            lastLog = now;
+            uint64_t d = dataQueueDrops_.load(std::memory_order_relaxed);
+            if (d != lastDrops) {
+                size_t qsz;
+                { std::lock_guard<std::mutex> lock(queueMutex); qsz = dataQueue.size(); }
+                std::cout << "[IntanSocket][DROP] dataQueue overflow (OE consumer too slow): "
+                          << "dataQueueDrops=" << d << " (+" << (d - lastDrops)
+                          << "/5s), queue=" << qsz << "/" << kMaxDataQueue
+                          << " -- SILENT loss, downstream of the SEQ check" << std::endl;
+                lastDrops = d;
+            }
+        }
+    }
+
     // Get packet from queue
     DataPacket packet;
     {

@@ -1150,14 +1150,16 @@ public:
     // their handlers, each of which tracks that stream's per-packet SEQ (word 4)
     // = the loss check. The board sends exactly one packet per datagram.
     // ------------------------------------------------------------------------
-    void udpRecvThread() {
-        // Give the receive thread HIGH scheduling priority so it keeps draining the
-        // socket even when the machine is saturated (e.g. an OpenEphys GUI event
-        // storm at ~300% CPU). If this thread is starved off-CPU, the kernel socket
-        // buffer fills, the host NIC emits an 802.3x PAUSE, and the BOARD's GEM TX
-        // stalls -> the board drops an archival broadband packet (which is why the
-        // drop is seen in net.py too -- it's board-side, host-triggered). Self-set,
-        // best-effort (privileged RT classes fall back gracefully).
+
+    // Raise the calling thread's scheduling priority so the OS keeps it running
+    // even when the machine is saturated (OpenEphys at ~300% CPU while the user
+    // adds GUI events). BOTH the recv and demux threads call this: the recv thread
+    // drains the socket, but the DEMUX thread does the real per-packet work (unpack
+    // + SEQ + route at ~28k pkts/s), so if demux is left at normal priority it gets
+    // starved, the recv->demux ring overflows, and packets are dropped -> exactly
+    // the host-side SEQ gaps seen in OpenEphys but never in net.py. Best-effort:
+    // privileged RT classes fall back gracefully if not permitted.
+    static void raiseThreadPriority() {
 #if defined(__APPLE__)
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #elif defined(__linux__)
@@ -1165,6 +1167,15 @@ public:
         sp.sched_priority = sched_get_priority_min(SCHED_FIFO) + 1;
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);   // needs privilege; ignored otherwise
 #endif
+    }
+
+    void udpRecvThread() {
+        // Give the receive thread HIGH scheduling priority so it keeps draining the
+        // socket even when the machine is saturated (e.g. an OpenEphys GUI event
+        // storm at ~300% CPU). See raiseThreadPriority(). BOTH the recv and demux
+        // threads need this -- if EITHER starves, the recv->demux ring backs up and
+        // we drop (a host-side broadband/LFP SEQ gap that net.py never shows).
+        raiseThreadPriority();
         udpSocket_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpSocket_ == INVALID_SOCKET) {
             std::cout << "[IntanInterface] UDP listener: socket() failed" << std::endl;
@@ -1285,6 +1296,11 @@ public:
     }
 
     void udpDemuxThread() {
+        // HIGH priority too -- the demux thread is the real per-packet worker and,
+        // if starved under OpenEphys CPU load, the ring overflows -> SEQ gaps.
+        raiseThreadPriority();
+        auto lastDropLog = std::chrono::steady_clock::now();
+        uint64_t lastRingDrops = 0;
         while (running_.load()) {
             std::vector<uint8_t> datagram;
             {
@@ -1297,6 +1313,26 @@ public:
                 ring_.pop_front();
             }
             demuxDatagram(datagram.data(), datagram.size());
+            // Surface ring overflow so the drop STAGE is visible: ringDrops_ climbing
+            // == recv->demux ring overflowed == the demux thread couldn't keep up
+            // (the SEQ-gap cause). If SEQ gaps appear but ringDrops_ stays flat, the
+            // loss is downstream (IntanSocket dataQueueDrops_ / OE sourceBuffer).
+            {
+                auto now = std::chrono::steady_clock::now();
+                if (now - lastDropLog > std::chrono::seconds(5)) {
+                    lastDropLog = now;
+                    uint64_t rd, ringSz;
+                    { std::lock_guard<std::mutex> lock(ringMutex_);
+                      rd = ringDrops_; ringSz = ring_.size(); }
+                    if (rd != lastRingDrops) {
+                        std::cout << "[IntanInterface][DROP] recv->demux ring overflow: "
+                                  << "ringDrops=" << rd << " (+" << (rd - lastRingDrops)
+                                  << "/5s), ring depth=" << ringSz << "/" << kRingMax
+                                  << " -- demux starved; SEQ gaps originate HERE" << std::endl;
+                        lastRingDrops = rd;
+                    }
+                }
+            }
             {
                 // Return the buffer to the free-list so the recv thread can reuse
                 // it without a malloc (keeps the hot recv path allocation-free).
