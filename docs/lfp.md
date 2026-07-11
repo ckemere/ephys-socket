@@ -1,6 +1,6 @@
 # LFP / DSP engine — configure recipe
 
-The plugin **receives** the LFP UDP stream (unified port 5000, demuxed by
+The plugin **receives** the LFP UDP stream (unified port 0x6800, demuxed by
 `stream_type = 2`) and publishes a second `DataStream`. It ships **one set
 of defaults** matching `remote/net.py`'s `configure_lfp("cic")` — the CIC
 comp-FIR halfband for the shipped PL datapath. The editor's `LFP` button
@@ -39,7 +39,7 @@ It implements:
   for the CIC datapath, quantized to Q1.17.
 - `configure_lfp(sock, datapath="cic", num_taps=None, cutoff_hz=1300.0)` —
   disables the engine, sets params, designs + uploads the filter.
-- `lfp_enable(sock, on)` — starts / stops UDP emission on port 5000
+- `lfp_enable(sock, on)` — starts / stops UDP emission on port 0x6800
   (unified with broadband, demuxed host-side by `stream_type = 2`).
 
 From the MicroZed repo's `remote/` directory:
