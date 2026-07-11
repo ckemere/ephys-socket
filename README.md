@@ -6,12 +6,12 @@ Forked from the original [Ephys Socket](https://github.com/open-ephys-plugins/ep
 by Jonathan Newman ([@jonnew](https://github.com/jonnew)); this fork replaces the
 generic matrix-over-TCP source with the MicroZed device protocol:
 
-- **TCP control** (port 6000): start/stop, configuration, chip auto-detection,
+- **TCP control** (port 0x6900 / 26880): start/stop, configuration, chip auto-detection,
   and the aux-sequencer commands. `IntanInterface.{h,cpp}` is a
   standalone C++ client for this protocol (no JUCE dependency) — it is the
   third consumer of the register/packet contract, after the firmware and
   `remote/net.py`.
-- **UDP data** (port 5000): one packet per ~30 kHz sample; 10 header words +
+- **UDP data** (port 0x6800 / 26624): one packet per ~30 kHz sample; 10 header words +
   up to 140 data words depending on the channel-enable mask.
 
 <p align="center">
@@ -26,8 +26,8 @@ MicroZed repo when changing the protocol.
 
 1. **Flash the board** with a current MicroZed image (`blobs/BOOT.bin` from the
    MicroZedIntanInterface repo) and put it on the network. Default device IP is
-   `192.168.18.10`; put your host on the same subnet (port 6000 TCP control,
-   5000 UDP data).
+   `192.168.18.10`; put your host on the same subnet (port 0x6900 TCP control,
+   0x6800 UDP data).
 2. **Install the plugin** (see [docs/building.md](docs/building.md)) so
    OpenEphys finds it in its `plugins` directory.
 3. In OpenEphys, open the **Processor List → Sources** and drag **Intan Socket**

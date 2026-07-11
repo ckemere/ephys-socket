@@ -1,7 +1,7 @@
 # Unified single-port packet consumer (branch `claude/unified-lfp`)
 
 The plugin now consumes the **unified single-port packet format**: broadband
-**and** LFP both arrive on **one UDP port** (default **5000**), demuxed host-side
+**and** LFP both arrive on **one UDP port** (default **0x6800 / 26624**), demuxed host-side
 by a `stream_type` field in a common header. This matches the MicroZed firmware
 on branch `claude/unified-ports` byte-for-byte. The authoritative spec is
 `mz-unified-ports/docs/unified-packet-format.md` (the *as-implemented* sections),
@@ -41,9 +41,9 @@ offset-binary int16 samples:
 
 ## What changed in the plugin
 
-- **One UDP socket on port 5000, promiscuous drain.** `Source/IntanInterface.cpp`
-  replaced the two per-stream listeners (broadband on 5000 + a separate **LFP
-  socket on 5001**) with a single unified listener: `udpRecvThread()` binds 5000
+- **One UDP socket on port 0x6800, promiscuous drain.** `Source/IntanInterface.cpp`
+  replaced the two per-stream listeners (broadband on 0x6800 + a separate **LFP
+  socket on 5001**) with a single unified listener: `udpRecvThread()` binds 0x6800
   with a **16 MB `SO_RCVBUF`** and does the minimum on the hot path (`recvfrom`
   → ring), so broadband is **never** blocked while a slow consumer runs;
   `udpDemuxThread()` pops the ring, peeks `stream_type`, and routes broadband →
@@ -70,7 +70,7 @@ offset-binary int16 samples:
   scorer.
 - **UI / docs:** the LFP button tooltip, `LfpFrame`/`setLfpEnabled` doc comments,
   and status comments no longer say "port 5001" — LFP is on the unified port,
-  `stream_type=2`. The editable UDP-port box already defaulted to 5000.
+  `stream_type=2`. The editable UDP-port box already defaulted to the broadband port (now 0x6800).
 
 ## Validation
 
@@ -121,7 +121,7 @@ cmake --build . --config Debug --target install
 Then launch the GUI, drop in the **Intan Socket** source, set the device IP,
 CONNECT, and (optionally) enable the firmware LFP engine via `remote/net.py`
 `configure_lfp(...)` + `lfp_on`, then reconnect to publish the second
-(LFP) DataStream. Broadband and LFP both arrive on UDP 5000 now.
+(LFP) DataStream. Broadband and LFP both arrive on UDP 0x6800 now.
 
 ## Mismatch risk vs the firmware
 
