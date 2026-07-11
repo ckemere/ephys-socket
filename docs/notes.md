@@ -32,11 +32,44 @@ zero-channel; chip indicators stay dark to prompt the user to RESCAN.
 ## LFP / DSP engine (second DataStream)
 
 Firmware ≥ 1.2 exposes a parallel LFP engine that low-pass filters and
-decimates the amplifier streams through a host-programmed FIR, emitting a
-**second UDP stream on port 5001** (broadband on 5000 is untouched). The
-plugin always binds port 5001 on connect; whether a second `DataStream` is
-published depends on the firmware reporting `lfp_enabled` in the status
-response.
+decimates the amplifier streams through a host-programmed FIR. It emits LFP
+frames on the **same unified UDP port as broadband** (`0x6800`), tagged
+`stream_type = 2` in the common header; the plugin demuxes the two streams off
+that single socket. Whether a second `DataStream` is published depends on the
+firmware reporting `lfp_enabled` in the status response.
+
+### Why one port, not one-port-per-stream
+
+LFP originally streamed on its **own** UDP port (5001; broadband on 5000). The
+firmware could do that essentially for free — the PL assembles each *complete*
+wire packet (header + samples) in its output BRAM and the PS just DMAs it
+straight into a `PBUF_REF` and sends it, so choosing a different destination
+port per stream costs the board nothing. The failure mode was entirely on the
+**receiver** side.
+
+If a per-stream port has **no socket draining it** — the LFP viewer is closed,
+or a tool binds 5001 only transiently — then *because nothing is listening*, the
+host **OS kernel** answers every datagram to that dead port with an **ICMP "port
+unreachable."** At the LFP frame rate that is a multi-kHz inbound flood back at
+the board, and the board's **fully-polled** network stack (NO_SYS lwIP, no
+interrupts) must receive and process every one of those ICMP replies. That stole
+time from the 30 kHz acquisition loop (recv→transmit spikes of 40–60 µs against a
+~33 µs budget) and drove catch-up bursts that exhausted the TX descriptors →
+**dropped broadband packets**. A controlled test isolated it precisely:
+broadband-only was pristine (~27 µs max, 0 over-budget, 0 drops); LFP-on with
+5001 *undrained* spiked to ~63 µs with ~250 over-budget packets and ~12 drops;
+LFP-on with 5001 *drained* was identical to broadband-only. So the firmware was
+never the bottleneck — an unlistened UDP port was.
+
+You *can* patch that host-side (keep a sink draining every stream port for the
+whole session), but it is a fragile rule to remember, especially in a GUI plugin
+where a viewer can be closed mid-run. Folding all streams onto **one** port
+removes the failure mode structurally: there is only ever one socket, broadband
+keeps it drained continuously, and LFP frames on that same port are simply
+demuxed — or harmlessly ignored if LFP isn't being consumed. Nothing ever lands
+on a dead port, so the host never emits ICMP and the board never sees the storm.
+That is why the design is a single unified port with a `stream_type` tag rather
+than a port per stream.
 
 **Configuration is out-of-band**: the filter design lives outside the
 plugin. Use `remote/net.py` from the MicroZedIntanInterface repo:
