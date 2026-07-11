@@ -25,6 +25,9 @@ set_property(DIRECTORY APPEND PROPERTY COMPILE_DEFINITIONS
 	OEPLUGIN
 	"$<$<PLATFORM_ID:Windows>:JUCE_API=__declspec(dllimport)>"
 	$<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>
+	# Suppress <windows.h>'s min/max macros project-wide (before ANY Windows header
+	# is pulled in via winsock2.h / <Windows.h> / JUCE) so std::min/std::max compile.
+	$<$<PLATFORM_ID:Windows>:NOMINMAX>
 	$<$<PLATFORM_ID:Linux>:JUCE_DISABLE_NATIVE_FILECHOOSERS=1>
 	$<$<CONFIG:Debug>:DEBUG=1>
 	$<$<CONFIG:Debug>:_DEBUG=1>
