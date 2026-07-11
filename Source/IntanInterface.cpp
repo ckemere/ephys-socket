@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cerrno>
 #include <array>
+#include <algorithm>   // std::max/std::min (not transitively guaranteed on MSVC)
 #include <cmath>
 
 // Platform-specific networking
@@ -36,6 +37,13 @@
     #define SOCKET_ERROR -1
     #define closesocket close
     using SOCKET = int;
+#endif
+
+// M_PI is a POSIX extension, not standard C++ -- MSVC's <cmath> omits it unless
+// _USE_MATH_DEFINES is set. Provide a portable fallback (used by the DSP filter
+// design below).
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 // ============================================================================
