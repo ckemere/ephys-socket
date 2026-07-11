@@ -14,8 +14,8 @@ class IntanSocket : public DataThread
 public:
     /** Default parameters */
     const String DEFAULT_DEVICE_IP = "192.168.18.10";
-    const int DEFAULT_TCP_PORT = 6000;
-    const int DEFAULT_UDP_PORT = 5000;
+    const int DEFAULT_TCP_PORT = 0x6900;   // 26880 -- must match firmware TCP_PORT
+    const int DEFAULT_UDP_PORT = 0x6800;   // 26624 -- must match firmware UDP_PORT
     const float SAMPLE_RATE = 30000.0f; // Fixed for now
     // Scaling matches the OpenEphys acquisition-board plugin exactly
     // (Source/devices/oni/AcqBoardONI.cpp getBitVolts + sample conversion):

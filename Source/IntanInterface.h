@@ -135,7 +135,7 @@ public:
         uint8_t rhdReg[22];
 
         // LFP/DSP engine config + status (firmware 0e99881+, status == 160).
-        // The engine emits LFP frames on the UNIFIED UDP port (default 5000),
+        // The engine emits LFP frames on the UNIFIED UDP port (default 0x6800),
         // tagged stream_type = 2. Decimated samples = popcount(lane_mask) x 32
         // amplifier channels per frame, at 30000/decim_R Hz. Configure with
         // CMD_LFP_SET_CHANNELS / CMD_LFP_SET_PARAMS / CMD_LFP_WRITE_COEF,
@@ -289,12 +289,12 @@ public:
      * @brief Constructor - discovers and initializes connection
      * 
      * @param deviceIp IP address of Zynq device (default: 192.168.18.10)
-     * @param tcpPort TCP command port (default: 6000)
-     * @param udpPort UDP data port (default: 5000)
+     * @param tcpPort TCP command port (default: 0x6900 / 26880)
+     * @param udpPort UDP data port (default: 0x6800 / 26624)
      */
     explicit IntanInterface(const std::string& deviceIp = "192.168.18.10",
-                           uint16_t tcpPort = 6000,
-                           uint16_t udpPort = 5000);
+                           uint16_t tcpPort = 0x6900,
+                           uint16_t udpPort = 0x6800);
     
     /**
      * @brief Destructor - cleanly shuts down threads and connections
@@ -615,7 +615,7 @@ public:
     //
     // The engine LP-filters and decimates the amplifier streams (the same 8
     // bit lanes as the broadband stream), emitting a parallel UDP datagram per
-    // output frame on the SAME port as broadband (default 5000), tagged
+    // output frame on the SAME port as broadband (default 0x6800), tagged
     // stream_type = 2 in the common header and demuxed host-side.
     //
     // Configure order: lfpEnable(false) -> lfpSetChannels(mask)

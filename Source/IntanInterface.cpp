@@ -55,7 +55,7 @@ namespace {
     // UNIFIED single-port packet format (matches mz-unified-ports firmware,
     // branch claude/unified-ports; authoritative spec docs/unified-packet-
     // format.md, host reference remote/net.py UnifiedSink). EVERY PL->host
-    // stream arrives on ONE UDP port (default 5000) and carries the same
+    // stream arrives on ONE UDP port (default 0x6800) and carries the same
     // 8-word little-endian common header; the host demuxes by stream_type.
     //   w0 MAGIC = 0xCAFEBABE
     //   w1 TYPE_VER = stream_type[7:0] | version[15:8] | flags[31:16]
@@ -284,7 +284,7 @@ public:
         // Auto-configure UDP destination
         autoConfigureUdp();
 
-        // Start the UNIFIED UDP listener: ONE socket on udpPort_ (5000) carries
+        // Start the UNIFIED UDP listener: ONE socket on udpPort_ (0x6800) carries
         // ALL streams (broadband + LFP), demuxed by stream_type. Two threads:
         //   * recvThread_  -- the hot path: recvfrom -> ring, nothing else, so
         //                     broadband is NEVER blocked while a slow consumer
@@ -1139,7 +1139,7 @@ public:
     }
     
     // ------------------------------------------------------------------------
-    // UNIFIED UDP listener (ONE socket on udpPort_ = 5000; ALL streams).
+    // UNIFIED UDP listener (ONE socket on udpPort_ = 0x6800; ALL streams).
     //
     // recvThread_ binds the socket with a big SO_RCVBUF and does the absolute
     // minimum on the hot path -- recvfrom into a ring -- so broadband is NEVER
@@ -1379,7 +1379,7 @@ public:
     }
 
     // LFP frame (UNIFIED stream_type = 2). The PL builds the whole wire packet
-    // (common header + decimated samples) and the PS just sends it on UDP 5000.
+    // (common header + decimated samples) and the PS just sends it on UDP 0x6800.
     // Header layout (docs/unified-packet-format.md, net.py receive_lfp):
     //   w0 MAGIC=0xCAFEBABE | w1 TYPE_VER (stream_type=2 | version<<8)
     //   w2/w3 = 64-bit master timestamp (newest input sample of the window)

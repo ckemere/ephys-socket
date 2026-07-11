@@ -264,7 +264,7 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     lfpEnableButton->setBounds(345, 103, 72, 18);
     lfpEnableButton->addListener(this);
     lfpEnableButton->setTooltip("Toggle the firmware LFP/DSP engine. LFP frames arrive on "
-                                "the SAME unified UDP port as broadband (default 5000), "
+                                "the SAME unified UDP port as broadband (default 0x6800), "
                                 "tagged stream_type=2. Filter design and channel mask are "
                                 "set out-of-band -- run remote/net.py configure_lfp(...) "
                                 "FIRST, then enable here. Toggling re-runs updateSettings.");
