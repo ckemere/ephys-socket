@@ -53,6 +53,12 @@ A connected **headstage accelerometer** (auxin1/2/3) shows up on the AUX
 channels — select the **AUX** channel type in the LFP viewer's range selector
 to see it at the right scale.
 
+> ⚠️ **Don't run `net.py` at the same time as this plugin.** Both bind the same UDP
+> data port, so whichever is up consumes the datagrams. If `net.py` is running, the
+> plugin will still **CONNECT and look fine** (control is over TCP) but its data
+> packets get **swallowed by `net.py`** — the channels appear but show no (or partial)
+> data. Quit `net.py` before pressing **play**.
+
 ## Further reading
 
 - [docs/notes.md](docs/notes.md) — editor controls reference, aux-sequencer /
