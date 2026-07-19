@@ -211,8 +211,10 @@ bool IntanSocket::connectDevice(bool printOutput)
         num_channels = calculateNumChannels(channel_enable_mask);
         debugMode = (status.debugMode != 0);
 
-        // Aux sequencer state (already persisted across reconnect)
-        auxSeqMode   = status.hasAuxStatus && status.auxSeqEnabled;
+        // The aux engine is always on, so the firmware status can't tell us whether
+        // the housekeeping banks or the plain per-axis banks are loaded. auxSeqMode is
+        // therefore a local UI flag (set by the AUX SEQ button); it defaults to plain
+        // on a fresh connect rather than being synced from the (always-true) status bit.
 
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
@@ -1127,18 +1129,40 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
 
     if (!enable)
     {
-        // Firmware clears the live fast-settle/digout sources and waits one
-        // packet before dropping the enable (so the chip is never left
-        // clamped); mirror the local state.
-        fastSettleSw = false;
-        if (!intanInterface->auxSeqEnable(false))
+        // The aux engine is always on, so "off" restores the plain per-axis aux
+        // (the legacy all-3-axes-per-packet format) by loading CONVERT(32/33/34)
+        // into each slot's standby bank and swapping to it.
+        IntanInterface::DeviceStatus status;
+        if (!intanInterface->getStatus(status))
         {
-            LOGE("Failed to disable aux sequencer");
+            LOGE("Aux: status read failed");
             return false;
         }
+        int target[3];
+        for (int s = 0; s < 3; ++s)
+            target[s] = ((status.auxBankActive >> s) & 1) ^ 1;
+
+        std::vector<uint16_t> plain0 = { IntanInterface::rhdConvert(32) };
+        std::vector<uint16_t> plain1 = { IntanInterface::rhdConvert(33) };
+        std::vector<uint16_t> plain2 = { IntanInterface::rhdConvert(34) };
+        if (!intanInterface->auxUploadBank(0, target[0], plain0, 0) ||
+            !intanInterface->auxUploadBank(1, target[1], plain1, 0) ||
+            !intanInterface->auxUploadBank(2, target[2], plain2, 0))
+        {
+            LOGE("Aux plain-bank upload failed");
+            return false;
+        }
+        for (int s = 0; s < 3; ++s)
+        {
+            if (!intanInterface->auxBankSelect(s, target[s]))
+            {
+                LOGE("Aux bank select failed (slot ", s, ")");
+                return false;
+            }
+        }
         auxSeqMode = false;
-        LOGC("Aux sequencer disabled - legacy aux format (all 3 axes per packet)");
-        CoreServices::sendStatusMessage("Intan: aux sequencer off");
+        LOGC("Aux: plain per-axis format restored (all 3 axes per packet)");
+        CoreServices::sendStatusMessage("Intan: aux plain format");
         return true;
     }
 
@@ -1199,11 +1223,8 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
         }
     }
 
-    if (!status.auxSeqEnabled && !intanInterface->auxSeqEnable(true))
-    {
-        LOGE("Failed to enable aux sequencer");
-        return false;
-    }
+    // (No enable step: the aux engine is always on -- uploading + selecting the
+    // banks is all that's needed.)
 
     // Reset the de-interleave state for all 4 aux banks to midscale
     for (int b = 0; b < 4; ++b)

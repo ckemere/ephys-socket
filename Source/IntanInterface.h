@@ -100,7 +100,7 @@ public:
         // status response). hasAuxStatus is false when talking to older
         // 86-byte firmware -- the fields below are then all zero.
         bool hasAuxStatus;
-        bool auxSeqEnabled;       // per-packet latched aux_seq_en
+        bool auxSeqEnabled;       // aux engine active (always true; aux-default)
         bool fastSettleActive;    // live RHD Reg-0 D5 state
         bool digoutState;         // live auxout mirror bit
         bool dspResetActive;      // CONVERT bit-H forcing active
@@ -542,9 +542,6 @@ public:
      * The firmware polls bank_active and only ACKs once the swap landed.
      */
     bool auxBankSelect(int slot, int bank);
-
-    /** @brief Enable/disable the aux command sequencer (default off). */
-    bool auxSeqEnable(bool enable);
 
     /**
      * @brief Configure amplifier fast settle (RHD Reg-0 D5).

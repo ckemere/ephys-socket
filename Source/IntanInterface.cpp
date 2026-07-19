@@ -137,7 +137,7 @@ namespace {
         // mirrors firmware/src-core0/network.c + remote/net.py)
         CMD_AUX_WRITE_WORD = 0x70,   // p1 = slot | bank<<8 | is_len<<16; p2 = addr<<16 | data
         CMD_AUX_BANK_SELECT = 0x71,  // p1 = slot; p2 = bank (confirmed before ACK)
-        CMD_AUX_SEQ_EN = 0x72,       // p1 = 0/1
+        // 0x72 retired (was CMD_AUX_SEQ_EN): the aux command engine is always on
         CMD_READ_REGISTER = 0x73,    // p1 = reg -> 4-byte {cipo1,cipo0} response
         CMD_WRITE_REGISTER = 0x74,   // p1 = reg; p2 = value -> 4-byte echo response
         CMD_SET_FAST_SETTLE = 0x75,  // p1 = amp: sw|gpio_en<<1|pin<<4; p2 = dsp: same layout
@@ -626,10 +626,6 @@ public:
     bool auxBankSelect(int slot, int bank) {
         // Firmware polls bank_active (up to ~50 ms) before ACKing
         return sendCommand(CMD_AUX_BANK_SELECT, slot & 3, bank & 1);
-    }
-
-    bool auxSeqEnable(bool enable) {
-        return sendCommand(CMD_AUX_SEQ_EN, enable ? 1 : 0);
     }
 
     bool setFastSettle(bool softwareLevel, bool gpioEnable, uint8_t gpioPin,
@@ -1889,10 +1885,6 @@ bool IntanInterface::auxBankSelect(int slot, int bank) {
     return pImpl_->auxBankSelect(slot, bank);
 }
 
-bool IntanInterface::auxSeqEnable(bool enable) {
-    return pImpl_->auxSeqEnable(enable);
-}
-
 bool IntanInterface::setFastSettle(bool softwareLevel, bool gpioEnable,
                                    uint8_t gpioPin, bool dspReset) {
     return pImpl_->setFastSettle(softwareLevel, gpioEnable, gpioPin, dspReset);
@@ -2048,7 +2040,7 @@ std::string IntanInterface::DeviceStatus::getSummary() const {
     if (!hasAuxStatus) {
         oss << "(not supported by this firmware -- 86-byte status)\n";
     } else {
-        oss << "Enabled: " << (auxSeqEnabled ? "YES" : "no")
+        oss << "Engine: " << (auxSeqEnabled ? "on" : "OFF?")
             << "  Fast settle: " << (fastSettleActive ? "ACTIVE" : "off")
             << "  Digout: " << (digoutState ? "1" : "0")
             << "  DSP reset: " << (dspResetActive ? "ACTIVE" : "off") << "\n";
