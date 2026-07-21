@@ -525,9 +525,10 @@ public:
     /**
      * @brief Upload a command program (and its length record) into one bank.
      *
-     * @param slot 0..2 (slot 0 -> COPI cycle 32, real-time control;
-     *             slot 1 -> cycle 33, ADC/accelerometer;
-     *             slot 2 -> cycle 34, config/housekeeping)
+     * @param slot 0..2 (slot 0 -> COPI cycle 32, real-time control register;
+     *             slot 1 -> cycle 33, ADC/accelerometer cycling program;
+     *             slot 2 -> cycle 34, one-shot inject register). Only slot 1
+     *             is a true program with banks; slots 0/2 are single registers.
      * @param bank 0 or 1 (write the STANDBY bank while the other plays)
      * @param commands 1..64 RHD command words
      * @param loopIndex index the program wraps back to (entries before it
