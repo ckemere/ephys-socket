@@ -212,9 +212,9 @@ bool IntanSocket::connectDevice(bool printOutput)
         debugMode = (status.debugMode != 0);
 
         // The aux engine is always on, so the firmware status can't tell us whether
-        // the housekeeping banks or the plain per-axis banks are loaded. auxSeqMode is
-        // therefore a local UI flag (set by the AUX SEQ button); it defaults to plain
-        // on a fresh connect rather than being synced from the (always-true) status bit.
+        // the accel-sweep program or the plain per-axis format is loaded. auxSeqMode
+        // is therefore a local UI flag (set by the AUX SEQ button); it defaults to
+        // plain on a fresh connect rather than being synced from the (always-true) bit.
 
         // Fast-settle / TTL state: prefer the new aux_ctrl readback
         // (firmware 65d5fb5+) which surfaces the actual SW level and TTL
@@ -733,8 +733,8 @@ bool IntanSocket::updateBuffer()
     //    packet's header word 5 [15:0] echoes the originating command, which
     //    identifies the axis. De-interleave by echo with sample-and-hold so
     //    the 3 output channels stay at the full 30 kHz buffer rate.
-    //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's
-    //    housekeeping result -- neither is accelerometer data in this mode.)
+    //    (Cycle 34 = slot 0's Reg-3 write echo and cycle 1 = slot 2's inject
+    //    register / injected-read result -- neither is accelerometer data.)
     //
     // UNIFIED header field mapping (docs/unified-packet-format.md, net.py
     // print_aux_info):
@@ -1130,8 +1130,8 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     if (!enable)
     {
         // The aux engine is always on, so "off" restores the plain per-axis aux
-        // (the legacy all-3-axes-per-packet format) by loading CONVERT(32/33/34)
-        // into each slot's standby bank and swapping to it.
+        // (all 3 axes every packet): CONVERT(32) in the slot-0 register, CONVERT(33)
+        // in the slot-1 program, CONVERT(34) in the slot-2 register.
         IntanInterface::DeviceStatus status;
         if (!intanInterface->getStatus(status))
         {
@@ -1152,13 +1152,11 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
             LOGE("Aux plain-bank upload failed");
             return false;
         }
-        for (int s = 0; s < 3; ++s)
+        // Only slot 1 (the program) swaps banks; slots 0 and 2 are registers.
+        if (!intanInterface->auxBankSelect(1, target[1]))
         {
-            if (!intanInterface->auxBankSelect(s, target[s]))
-            {
-                LOGE("Aux bank select failed (slot ", s, ")");
-                return false;
-            }
+            LOGE("Aux bank select failed (slot 1)");
+            return false;
         }
         auxSeqMode = false;
         LOGC("Aux: plain per-axis format restored (all 3 axes per packet)");
@@ -1187,40 +1185,30 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     for (int s = 0; s < 3; ++s)
         target[s] = status.auxSeqEnabled ? (((status.auxBankActive >> s) & 1) ^ 1) : 0;
 
-    // Default slot programs (mirrors remote/net.py):
-    //   slot 0 (cycle 32, real-time): Reg-3 carrier - rewritten by the
-    //           override shadow every packet (digout mirror / fast settle home)
-    //   slot 1 (cycle 33, ADC): accelerometer sweep, one axis per packet
-    //   slot 2 (cycle 34, housekeeping): supply, temp, chip ID, 'INTAN' ROM
+    // Default aux commands (mirrors remote/net.py aux_demo_setup):
+    //   slot 0 (cycle 32, RT): Reg-3 digout carrier - rewritten by the override
+    //           shadow every packet (digout mirror / fast-settle home).
+    //   slot 1 (cycle 33, ADC): accelerometer sweep, one axis per packet -- the
+    //           ONLY cycling slot.
+    //   slot 2 (cycle 34): the inject register; left at its default. Injection
+    //           whole-replaces it on demand; housekeeping is read on demand.
     std::vector<uint16_t> slot0 = { IntanInterface::rhdWrite(3, 0x02) };
     std::vector<uint16_t> slot1 = { IntanInterface::rhdConvert(32),
                                     IntanInterface::rhdConvert(33),
                                     IntanInterface::rhdConvert(34) };
-    std::vector<uint16_t> slot2 = { IntanInterface::rhdConvert(48),
-                                    IntanInterface::rhdConvert(49),
-                                    IntanInterface::rhdRead(63),
-                                    IntanInterface::rhdRead(62),
-                                    IntanInterface::rhdRead(40),
-                                    IntanInterface::rhdRead(41),
-                                    IntanInterface::rhdRead(42),
-                                    IntanInterface::rhdRead(43),
-                                    IntanInterface::rhdRead(44) };
 
     if (!intanInterface->auxUploadBank(0, target[0], slot0, 0) ||
-        !intanInterface->auxUploadBank(1, target[1], slot1, 0) ||
-        !intanInterface->auxUploadBank(2, target[2], slot2, 0))
+        !intanInterface->auxUploadBank(1, target[1], slot1, 0))
     {
         LOGE("Aux bank upload failed");
         return false;
     }
 
-    for (int s = 0; s < 3; ++s)
+    // Only slot 1 (the program) has a bank to swap; slots 0 and 2 are registers.
+    if (!intanInterface->auxBankSelect(1, target[1]))
     {
-        if (!intanInterface->auxBankSelect(s, target[s]))
-        {
-            LOGE("Aux bank select failed (slot ", s, ", bank ", target[s], ")");
-            return false;
-        }
+        LOGE("Aux bank select failed (slot 1, bank ", target[1], ")");
+        return false;
     }
 
     // (No enable step: the aux engine is always on -- uploading + selecting the
@@ -1234,8 +1222,8 @@ bool IntanSocket::setAuxSequencerMode(bool enable)
     auxSeqMode = true;
     if (status.auxSeqEnabled)
     {
-        LOGC("Aux banks reloaded LIVE via standby-bank swap (slots now on banks ",
-             target[0], "/", target[1], "/", target[2], ")");
+        LOGC("Aux accel program reloaded LIVE via standby-bank swap (slot 1 now on bank ",
+             target[1], ")");
     }
     else
     {
