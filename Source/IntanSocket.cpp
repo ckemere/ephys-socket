@@ -614,7 +614,7 @@ bool IntanSocket::updateBuffer()
     int64 timestamp = (static_cast<uint64_t>(packet.data.data()[3]) << 32) | packet.data.data()[2];
 
     // Skip the full 14-word unified broadband header; the data words that
-    // follow are byte-identical to the legacy stream.
+    // follow are unchanged by the header reformat.
     const uint32_t* dataWords = packet.data.data() + kBroadbandHeaderWords;
     size_t numDataWords = packet.data.size() - kBroadbandHeaderWords;
 
@@ -724,7 +724,7 @@ bool IntanSocket::updateBuffer()
     // (the packet is self-describing -- stays correct through live bank swaps
     // and sequencer enable/disable -- firmware aux-seq-v2):
     //
-    //  * Legacy (sequencer off, flags==0): the static table converts all
+    //  * Plain per-axis (flags bit0 == 0): unused now (the aux engine is always on);
     //    three aux inputs every packet; results sit at cycles 34/0/1.
     //
     //  * Aux-sequencer mode (flags bit0 set): slot 1 sweeps ONE accelerometer
@@ -741,7 +741,7 @@ bool IntanSocket::updateBuffer()
     //   AUX1 = common-header word 6 = {echo0[31:16], aux_flags[15:8], digital_in[7:0]}
     //   sub-block word 8           = {echo_slot2_prev[31:16], echo_slot1_prev[15:0]}
     // The slot-1 accelerometer command echo that drives the de-interleave is in
-    // the LOW 16 bits of word 8 (was word 5 in the legacy 10-word header).
+    // the LOW 16 bits of word 8.
     // Port B uses the SAME header echo as port A.
     {
         uint32_t auxWord  = packet.data.data()[6];   // AUX1 (flags + digital_in + echo0)

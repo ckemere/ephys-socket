@@ -604,7 +604,7 @@ public:
      * 
      * Packet size depends on channel enable setting (UNIFIED broadband format):
      * - Header: 14 words (8-word common header + 6-word broadband sub-block)
-     * - Data: variable based on enabled channels (byte-identical to legacy)
+     * - Data: variable based on enabled channels (unchanged by the header reformat)
      * 
      * @param channelMask Channel enable mask (0x0-0xF)
      * @return Expected packet size in 32-bit words

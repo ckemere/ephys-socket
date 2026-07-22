@@ -51,13 +51,7 @@
 // ============================================================================
 
 namespace {
-    constexpr uint32_t CMD_MAGIC = 0xDEADBEEF;
-    // Legacy two-word packet magic {0xDEADBEEF, 0xCAFEBABE}. The UNIFIED format
-    // (docs/unified-packet-format.md) replaces this with a single-word MAGIC in
-    // header word 0 plus a stream_type byte in word 1 (see below). Kept only for
-    // historical reference / the command protocol (CMD_MAGIC is unchanged).
-    constexpr uint32_t PACKET_MAGIC_LOW = 0xDEADBEEF;
-    constexpr uint32_t PACKET_MAGIC_HIGH = 0xCAFEBABE;
+    constexpr uint32_t CMD_MAGIC = 0xDEADBEEF;   // command-protocol magic
 
     // ------------------------------------------------------------------------
     // UNIFIED single-port packet format (matches mz-unified-ports firmware,
@@ -79,7 +73,7 @@ namespace {
 
     constexpr size_t CMD_PACKET_SIZE = 20;
     constexpr size_t ACK_PACKET_SIZE = 3;
-    // Firmware status response has grown over time:
+    // Firmware status response tiers (we require the current full size):
     //   86  bytes  pre-aux firmware
     //   98  bytes  aux-seq-v2 (aux sequencer block)
     //  122  bytes  + DMA/perf instrumentation (fw 1.1.0.0)
@@ -91,18 +85,16 @@ namespace {
     //              wire struct shrank 288 -> 264 B). This plugin decodes only
     //              through rhd_reg[22] (ends at offset 148); the appended
     //              chirp/spike/TX-drop blocks (148..264) are simply ignored.
-    // The buffer must be sized to at least the largest known form, or extra
-    // bytes will sit unread in the TCP queue and corrupt the next command's
-    // ACK. The parser accepts any size >= STATUS_RESPONSE_SIZE_LEGACY and
-    // decodes optional fields based on what the device actually sent, so
-    // newer firmware that grows the response further will still parse — we
-    // just leave the extra headroom empty.
-    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // buffer, with room to grow
-    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;
+    // The buffer is oversized so leftover bytes can't sit unread in the TCP queue
+    // and corrupt the next command's ACK. We require the full current status
+    // (STATUS_RESPONSE_SIZE_RHD) and still parse a larger response from newer
+    // firmware (optional blocks are gated by their length threshold); anything
+    // smaller than the current firmware's status is rejected.
+    constexpr size_t STATUS_RESPONSE_SIZE = 512;   // receive buffer, with room to grow
+    constexpr size_t STATUS_RESPONSE_SIZE_RHD = 148;   // the current firmware's status
     constexpr size_t STATUS_RESPONSE_SIZE_AUXCTRL = 126;
     constexpr size_t STATUS_RESPONSE_SIZE_PERF = 122;
     constexpr size_t STATUS_RESPONSE_SIZE_AUX = 98;
-    constexpr size_t STATUS_RESPONSE_SIZE_LEGACY = 86;
 
     // CTRL_REG_AUX_CTRL bit layout (mirrors firmware/include/main.h).
     constexpr uint32_t AUX_CTRL_SEQ_EN              = 1u << 0;
@@ -150,10 +142,10 @@ namespace {
     
     // Broadband packet header (UNIFIED format): the 8-word common header PLUS a
     // 6-word broadband sub-block = 14 header words ahead of the data words (the
-    // data words are byte-identical to the legacy stream). See net.py
+    // data words are unchanged by the header reformat). See net.py
     // BB_HEADER_WORDS = 14 and docs/unified-packet-format.md "As implemented".
     //   w0..w7  = common header (above)
-    //   w8      = sub-block: prev-packet slot-2/3 aux echoes (old header w5)
+    //   w8      = sub-block: prev-packet plain/inject-slot aux echoes
     //   w9..w12 = sub-block: 8 external-ADC breadcrumbs (currently 0)
     //   w13     = sub-block: reserved
     //   w14..   = DATA words
@@ -475,10 +467,10 @@ public:
             return false;
         }
 
-        // Accept any size >= LEGACY (see STATUS_RESPONSE_SIZE comment). The
-        // parser below decodes optional blocks by their length threshold, so
-        // future firmware that grows the response only adds bytes we ignore.
-        if (dataLen < STATUS_RESPONSE_SIZE_LEGACY) {
+        // Require the full current status (see STATUS_RESPONSE_SIZE comment). A
+        // larger response from newer firmware still parses (optional blocks are
+        // gated by length); anything smaller is rejected.
+        if (dataLen < STATUS_RESPONSE_SIZE_RHD) {
             return false;
         }
         
@@ -1408,7 +1400,7 @@ public:
                 // the ring, and causes MORE drops -> a self-amplifying cascade.
                 seqGaps_++;
                 seqLostPackets_ += delta;
-                timestampErrors_++;   // keep the legacy "loss" counter moving too
+                timestampErrors_++;   // keep the timestamp-based loss counter moving too
                 totalErrors_++;
                 static thread_local std::chrono::steady_clock::time_point lastBbLoss{};
                 auto nowTp = std::chrono::steady_clock::now();
