@@ -1111,14 +1111,15 @@ public:
     // privileged RT classes fall back gracefully if not permitted.
     static void raiseThreadPriority() {
 #if defined(__APPLE__)
-        // USER_INTERACTIVE QoS alone is NOT enough: under a saturated OpenEphys GUI
-        // (~300% CPU) the scheduler still preempts this thread enough to overflow the
-        // kernel UDP buffer -> the recv thread misses packets -> broadband SEQ gaps
-        // that net.py (no GUI competing) never shows. Promote to REAL-TIME
-        // time-constraint scheduling -- the exact mechanism CoreAudio uses for its
-        // render thread, and it works UNPRIVILEGED. The scheduler then guarantees this
-        // thread a CPU slice at a high rate and won't let rendering threads starve it.
-        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        // Promote to REAL-TIME time-constraint scheduling (CoreAudio's render-thread
+        // mechanism; works unprivileged) so OE's GUI/render threads can't preempt the
+        // socket drain -> kernel UDP overflow -> broadband SEQ gaps that net.py (no GUI)
+        // never shows. CRITICAL: a thread that has a QoS class assigned is system-managed
+        // and thread_policy_set(TIME_CONSTRAINT) is REJECTED on it. std::thread threads
+        // are QOS_CLASS_UNSPECIFIED, so apply time-constraint directly and only fall back
+        // to a QoS class if the kernel refuses. (The prior version set QoS first and the
+        // RT policy silently failed.)
+        kern_return_t kr = KERN_FAILURE;
         mach_timebase_info_data_t tb;
         if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer != 0) {
             auto ms_to_abs = [&](double ms) -> uint32_t {
@@ -1128,11 +1129,22 @@ public:
             pol.period      = ms_to_abs(1.0);   // eligible to run ~every 1 ms
             pol.computation = ms_to_abs(0.3);   // guaranteed up to 0.3 ms CPU per period
             pol.constraint  = ms_to_abs(1.0);   // ...within a 1 ms deadline
-            pol.preemptible = 1;                // yield after the quantum (it mostly blocks on recv)
-            thread_policy_set(pthread_mach_thread_np(pthread_self()),
-                              THREAD_TIME_CONSTRAINT_POLICY,
-                              (thread_policy_t)&pol,
-                              THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+            pol.preemptible = 0;                // don't let a render thread preempt mid-drain
+            kr = thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                                   THREAD_TIME_CONSTRAINT_POLICY,
+                                   (thread_policy_t)&pol,
+                                   THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+        }
+        if (kr != KERN_SUCCESS)
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // fallback
+        {
+            // Log ONCE per thread (recv + demux) so it's visible whether RT engaged.
+            static std::atomic<int> rtLogged { 0 };
+            if (rtLogged.fetch_add(1) < 2)
+                std::cout << "[IntanInterface] recv/demux real-time scheduling: "
+                          << (kr == KERN_SUCCESS ? "ENABLED (time-constraint)"
+                                                 : "REJECTED -> QoS fallback")
+                          << " (kr=" << (int)kr << ")" << std::endl;
         }
 #elif defined(__linux__)
         struct sched_param sp; std::memset(&sp, 0, sizeof(sp));
@@ -1222,48 +1234,74 @@ public:
 
         startTime_ = std::chrono::steady_clock::now();
 
+        // Thread-local buffer pools so the recv hot path never mallocs and never locks
+        // per datagram: `spare` = recycled empty buffers to fill, `batch` = filled
+        // datagrams to publish. Refilled from the demux-returned free-list in bulk.
+        std::vector<std::vector<uint8_t>> spare;
+        std::vector<std::vector<uint8_t>> batch;
+        spare.reserve(kMaxRecvBatch);
+        batch.reserve(kMaxRecvBatch);
+        auto takeBuf = [&]() -> std::vector<uint8_t> {
+            if (!spare.empty()) { auto b = std::move(spare.back()); spare.pop_back(); return b; }
+            return std::vector<uint8_t>();
+        };
+
         while (running_.load()) {
             struct sockaddr_in senderAddr;
             socklen_t senderLen = sizeof(senderAddr);
 
-            // Reuse a recycled buffer instead of allocating one per packet.
-            std::vector<uint8_t> buffer;
-            {
-                std::lock_guard<std::mutex> lock(ringMutex_);
-                if (!recvFreeList_.empty()) {
-                    buffer = std::move(recvFreeList_.back());
-                    recvFreeList_.pop_back();
-                }
-            }
-            buffer.resize(4096);   // reuses capacity when recycled -> no realloc
-
+            // (1) BLOCKING recv for the first datagram of the chunk. SO_RCVTIMEO makes
+            //     this return ~once/sec when idle so we can re-check running_.
+            std::vector<uint8_t> buffer = takeBuf();
+            buffer.resize(4096);
             int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.data()),
                                     buffer.size(), 0,
                                     reinterpret_cast<struct sockaddr*>(&senderAddr),
                                     &senderLen);
-
-            if (received <= 0) {
-                // timeout (EAGAIN) or error -> recycle the unused buffer, re-check running_
-                std::lock_guard<std::mutex> lock(ringMutex_);
-                if (recvFreeList_.size() < kFreeListMax)
-                    recvFreeList_.push_back(std::move(buffer));
+            if (received <= 0) {          // timeout / error
+                spare.push_back(std::move(buffer));
                 continue;
             }
-
             buffer.resize((size_t)received);
+            batch.push_back(std::move(buffer));
+
+            // (2) Drain every OTHER datagram already queued in the socket WITHOUT
+            //     blocking -- this is the chunk. After a scheduling gap the whole
+            //     backlog comes out in one pass (catch-up), capped at kMaxRecvBatch.
+            while (batch.size() < kMaxRecvBatch) {
+                std::vector<uint8_t> b = takeBuf();
+                b.resize(4096);
+                int m = recvfrom(udpSocket_, reinterpret_cast<char*>(b.data()),
+                                 b.size(), MSG_DONTWAIT,
+                                 reinterpret_cast<struct sockaddr*>(&senderAddr),
+                                 &senderLen);
+                if (m <= 0) {             // EAGAIN/EWOULDBLOCK: nothing more queued now
+                    spare.push_back(std::move(b));
+                    break;
+                }
+                b.resize((size_t)m);
+                batch.push_back(std::move(b));
+            }
+
+            // (3) Publish the whole chunk under ONE lock + ONE notify, then top up the
+            //     thread-local spare pool from the demux-returned free-list in bulk.
             {
                 std::lock_guard<std::mutex> lock(ringMutex_);
-                if (ring_.size() >= kRingMax) {
-                    // Host-side ring overflow (NOT a board drop). Surface it as
-                    // a reception error so it's never silently hidden.
-                    ringDrops_++;
-                    if (recvFreeList_.size() < kFreeListMax)
-                        recvFreeList_.push_back(std::move(buffer));   // recycle on overflow
-                } else {
-                    ring_.push_back(std::move(buffer));
-                    ringCv_.notify_one();
+                for (auto& d : batch) {
+                    if (ring_.size() >= kRingMax) {
+                        ringDrops_++;                                    // host ring overflow
+                        if (spare.size() < kMaxRecvBatch) spare.push_back(std::move(d));
+                    } else {
+                        ring_.push_back(std::move(d));
+                    }
+                }
+                ringCv_.notify_one();
+                while (spare.size() < kMaxRecvBatch && !recvFreeList_.empty()) {
+                    spare.push_back(std::move(recvFreeList_.back()));
+                    recvFreeList_.pop_back();
                 }
             }
+            batch.clear();
         }
     }
 
@@ -1273,22 +1311,35 @@ public:
         raiseThreadPriority();
         auto lastDropLog = std::chrono::steady_clock::now();
         uint64_t lastRingDrops = 0;
+        std::vector<std::vector<uint8_t>> localBatch;   // whole ring drained per wakeup
+        localBatch.reserve(kMaxRecvBatch);
         while (running_.load()) {
-            std::vector<uint8_t> datagram;
             {
                 std::unique_lock<std::mutex> lock(ringMutex_);
                 ringCv_.wait_for(lock, std::chrono::milliseconds(200),
                                  [this] { return !ring_.empty() || !running_.load(); });
-                if (ring_.empty())
-                    continue;
-                datagram = std::move(ring_.front());
-                ring_.pop_front();
+                // Swap out ALL queued datagrams in one shot -- one lock per chunk, not
+                // per datagram.
+                while (!ring_.empty()) {
+                    localBatch.push_back(std::move(ring_.front()));
+                    ring_.pop_front();
+                }
             }
-            demuxDatagram(datagram.data(), datagram.size());
+            if (!localBatch.empty()) {
+                // Decode the chunk OUTSIDE the lock so the recv thread keeps publishing.
+                for (auto& d : localBatch)
+                    demuxDatagram(d.data(), d.size());
+                // Return the buffers to the free-list in bulk (one lock).
+                std::lock_guard<std::mutex> lock(ringMutex_);
+                for (auto& d : localBatch)
+                    if (recvFreeList_.size() < kFreeListMax)
+                        recvFreeList_.push_back(std::move(d));
+                localBatch.clear();
+            }
             // Surface ring overflow so the drop STAGE is visible: ringDrops_ climbing
-            // == recv->demux ring overflowed == the demux thread couldn't keep up
-            // (the SEQ-gap cause). If SEQ gaps appear but ringDrops_ stays flat, the
-            // loss is downstream (IntanSocket dataQueueDrops_ / OE sourceBuffer).
+            // == recv->demux ring overflowed == the demux couldn't keep up (a SEQ-gap
+            // cause). If SEQ gaps appear but ringDrops_ stays flat, the loss is UPSTREAM
+            // (kernel UDP overflow) or downstream (dataQueueDrops_ / OE sourceBuffer).
             {
                 auto now = std::chrono::steady_clock::now();
                 if (now - lastDropLog > std::chrono::seconds(5)) {
@@ -1304,13 +1355,6 @@ public:
                         lastRingDrops = rd;
                     }
                 }
-            }
-            {
-                // Return the buffer to the free-list so the recv thread can reuse
-                // it without a malloc (keeps the hot recv path allocation-free).
-                std::lock_guard<std::mutex> lock(ringMutex_);
-                if (recvFreeList_.size() < kFreeListMax)
-                    recvFreeList_.push_back(std::move(datagram));
             }
         }
         // Drain anything still queued at shutdown so we don't silently lose it.
@@ -1762,6 +1806,12 @@ public:
     // to ride out a long downstream stall without dropping a datagram; an
     // overflow is counted (ringDrops_) and surfaced, never silently hidden.
     static constexpr size_t kRingMax = 200000;
+    // Max datagrams the recv thread drains per wakeup into ONE locked hand-off, and the
+    // max the demux swaps out per wakeup. macOS has no recvmmsg(), so this MSG_DONTWAIT
+    // drain-into-chunk is the portable analogue of the acq-board's block reads: it
+    // amortizes the per-datagram lock/notify overhead ~256x and lets the recv thread
+    // catch up after a scheduling gap (bigger backlog -> bigger chunk). Tunable.
+    static constexpr size_t kMaxRecvBatch = 256;
     std::deque<std::vector<uint8_t>> ring_;
     std::mutex ringMutex_;
     std::condition_variable ringCv_;
