@@ -32,6 +32,9 @@
     #include <sched.h>
     #ifdef __APPLE__
         #include <pthread/qos.h>
+        #include <mach/mach.h>              // real-time (time-constraint) scheduling
+        #include <mach/thread_policy.h>
+        #include <mach/mach_time.h>
     #endif
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR -1
@@ -1108,7 +1111,29 @@ public:
     // privileged RT classes fall back gracefully if not permitted.
     static void raiseThreadPriority() {
 #if defined(__APPLE__)
+        // USER_INTERACTIVE QoS alone is NOT enough: under a saturated OpenEphys GUI
+        // (~300% CPU) the scheduler still preempts this thread enough to overflow the
+        // kernel UDP buffer -> the recv thread misses packets -> broadband SEQ gaps
+        // that net.py (no GUI competing) never shows. Promote to REAL-TIME
+        // time-constraint scheduling -- the exact mechanism CoreAudio uses for its
+        // render thread, and it works UNPRIVILEGED. The scheduler then guarantees this
+        // thread a CPU slice at a high rate and won't let rendering threads starve it.
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) == KERN_SUCCESS && tb.numer != 0) {
+            auto ms_to_abs = [&](double ms) -> uint32_t {
+                return (uint32_t)((ms * 1.0e6) * tb.denom / tb.numer);   // ns -> mach abs
+            };
+            thread_time_constraint_policy_data_t pol;
+            pol.period      = ms_to_abs(1.0);   // eligible to run ~every 1 ms
+            pol.computation = ms_to_abs(0.3);   // guaranteed up to 0.3 ms CPU per period
+            pol.constraint  = ms_to_abs(1.0);   // ...within a 1 ms deadline
+            pol.preemptible = 1;                // yield after the quantum (it mostly blocks on recv)
+            thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                              THREAD_TIME_CONSTRAINT_POLICY,
+                              (thread_policy_t)&pol,
+                              THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+        }
 #elif defined(__linux__)
         struct sched_param sp; std::memset(&sp, 0, sizeof(sp));
         sp.sched_priority = sched_get_priority_min(SCHED_FIFO) + 1;
