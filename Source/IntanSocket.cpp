@@ -582,24 +582,38 @@ bool IntanSocket::updateBuffer()
         if (now - lastLog > std::chrono::seconds(5)) {
             lastLog = now;
             uint64_t d = dataQueueDrops_.load(std::memory_order_relaxed);
-            if (d != lastDrops) {
-                size_t qsz;
-                { std::lock_guard<std::mutex> lock(queueMutex); qsz = dataQueue.size(); }
-                std::cout << "[IntanSocket][DROP] dataQueue overflow (OE consumer too slow): "
-                          << "dataQueueDrops=" << d << " (+" << (d - lastDrops)
-                          << "/5s), queue=" << qsz << "/" << kMaxDataQueue
-                          << " -- SILENT loss, downstream of the SEQ check" << std::endl;
-                lastDrops = d;
-            }
+            size_t qsz;
+            { std::lock_guard<std::mutex> lock(queueMutex); qsz = dataQueue.size(); }
+            int sb = sourceBuffers[0]->getNumSamples();
+            // Standing pipeline latency per stage -- should hover near ZERO (the big
+            // buffers are for burst absorption, not steady occupancy). sourceBuffer
+            // fill / SAMPLE_RATE is the display latency you feel; dataQueue should stay
+            // ~empty now that updateBuffer drains to empty. If sourceBuffer stays deep
+            // while dataQueue is ~0, the standing depth is in OE's own buffer (a paced
+            // consumer), not ours.
+            std::cout << "[IntanSocket][LATENCY] sourceBuffer=" << sb << " samp ("
+                      << (sb * 1000.0 / SAMPLE_RATE) << " ms), dataQueue=" << qsz
+                      << "/" << kMaxDataQueue;
+            if (d != lastDrops)
+                std::cout << "  DROPS +" << (d - lastDrops) << "/5s (total " << d << ")";
+            std::cout << std::endl;
+            lastDrops = d;
         }
     }
 
-    // Get packet from queue
+    // Drain EVERY queued packet this call so the dataQueue can never build a standing
+    // backlog -> latency (the "big buffer, kept empty" rule: the buffer is for burst
+    // absorption, not steady occupancy). OE calls updateBuffer in a tight loop, but its
+    // per-call overhead can drop the effective rate below the ~30 kHz arrival rate;
+    // one-packet-per-call then leaves a PERMANENT queue that shows up as display lag.
+    // Looping to empty decouples our drain from OE's call cadence. Nothing is dropped.
+    while (true)
+    {
     DataPacket packet;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         if (dataQueue.empty())
-            return true;
+            break;
 
         packet = std::move(dataQueue.front());   // move out, no copy
         dataQueue.pop();
@@ -786,6 +800,7 @@ bool IntanSocket::updateBuffer()
                                    1);  // ONE time sample
 
     totalSamples++;
+    }  // end while: drain the next queued packet (keep the dataQueue empty)
 
     return true;
 }
