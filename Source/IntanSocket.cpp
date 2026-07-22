@@ -550,12 +550,23 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
         // Consumer fell behind -> drop the OLDEST and count it, rather than grow
         // the queue without bound (see kMaxDataQueue note). A counted, bounded
         // drop here is far better than the uncounted allocator-stall spiral.
+        // Recycle the dropped buffer instead of freeing it.
+        if (bufferPool_.size() < kBufferPoolMax)
+            bufferPool_.push_back(std::move(dataQueue.front().data));
         dataQueue.pop();
         dataQueueDrops_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // Reuse a pooled buffer so this hot path (running ON the demux thread) does NO
+    // per-packet heap alloc -- assign() into an already-sized buffer reuses its
+    // capacity. A fresh alloc here is what churns the allocator and stalls the demux
+    // -> ring backup -> SEQ gaps (net.py avoids exactly this by never allocating).
     DataPacket packet;
-    packet.data.assign(data, data + wordCount);
+    if (!bufferPool_.empty()) {
+        packet.data = std::move(bufferPool_.back());
+        bufferPool_.pop_back();
+    }
+    packet.data.assign(data, data + wordCount);   // reuses capacity: no realloc
     packet.timestamp = timestamp;
 
     dataQueue.push(std::move(packet));   // move, not copy
@@ -607,11 +618,19 @@ bool IntanSocket::updateBuffer()
     // per-call overhead can drop the effective rate below the ~30 kHz arrival rate;
     // one-packet-per-call then leaves a PERMANENT queue that shows up as display lag.
     // Looping to empty decouples our drain from OE's call cadence. Nothing is dropped.
+    std::vector<uint32_t> recycle;   // previous packet's buffer, returned to the pool
     while (true)
     {
     DataPacket packet;
     {
         std::lock_guard<std::mutex> lock(queueMutex);
+        // Return the previous iteration's buffer to the pool under the SAME lock as
+        // the next pop -- recycling costs no extra lock. The producer then reuses it
+        // (no per-packet alloc). capacity()>0 distinguishes a real buffer from a
+        // moved-from empty one.
+        if (recycle.capacity() > 0 && bufferPool_.size() < kBufferPoolMax)
+            bufferPool_.push_back(std::move(recycle));
+        recycle = std::vector<uint32_t>{};   // moved-from -> guaranteed empty/no capacity
         if (dataQueue.empty())
             break;
 
@@ -800,6 +819,7 @@ bool IntanSocket::updateBuffer()
                                    1);  // ONE time sample
 
     totalSamples++;
+    recycle = std::move(packet.data);   // hold this buffer for the next iteration's lock
     }  // end while: drain the next queued packet (keep the dataQueue empty)
 
     return true;

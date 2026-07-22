@@ -189,6 +189,16 @@ private:
     // drop-oldest with a counter instead. ~4 s of headroom at 30 kHz.
     static constexpr size_t kMaxDataQueue = 120000;
     std::atomic<uint64_t> dataQueueDrops_ { 0 };
+
+    // Recycle DataPacket word-buffers instead of malloc/free per packet. At 30 kHz a
+    // fresh vector alloc in processDataPacket + free when the packet is consumed churns
+    // the allocator -> latency drift -> recv/demux stall -> kernel UDP drops (SEQ gaps),
+    // exactly what the allocation-free recv/demux path is designed to avoid. Producer
+    // (processDataPacket) pulls a buffer from here and refills it via assign() (reuses
+    // capacity); consumer (updateBuffer) returns each drained buffer here. Move-only,
+    // guarded by queueMutex (same lock as dataQueue, so no extra locking).
+    std::vector<std::vector<uint32_t>> bufferPool_;
+    static constexpr size_t kBufferPoolMax = 1024;
     
     /** Buffers for conversion */
     std::vector<float> convbuf;
