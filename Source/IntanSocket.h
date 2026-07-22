@@ -204,7 +204,7 @@ private:
     bool debugMode;
 
     /** Aux sequencer tooling state */
-    bool auxSeqMode = false;       // banked aux programs active
+    bool auxSeqMode = true;        // accel sweep active (the board boots into it)
     bool fastSettleSw = false;     // software fast-settle level
     int fastSettleTTL = -1;        // digital_in pin for fast settle (-1 = off)
 

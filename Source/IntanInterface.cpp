@@ -145,7 +145,8 @@ namespace {
     // data words are unchanged by the header reformat). See net.py
     // BB_HEADER_WORDS = 14 and docs/unified-packet-format.md "As implemented".
     //   w0..w7  = common header (above)
-    //   w8      = sub-block: prev-packet plain/inject-slot aux echoes
+    //   w8      = sub-block: prev-packet fs/inject-slot aux echoes (the sweep-slot
+    //             echo is in w6[31:16], paired intra-packet with data word 34)
     //   w9..w12 = sub-block: 8 external-ADC breadcrumbs (currently 0)
     //   w13     = sub-block: reserved
     //   w14..   = DATA words

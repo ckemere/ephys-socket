@@ -253,13 +253,13 @@ IntanSocketEditor::IntanSocketEditor(GenericProcessor* parentNode, IntanSocket* 
     auxModeButton->setRadius(3.0f);
     auxModeButton->setBounds(345, 78, 72, 18);
     auxModeButton->addListener(this);
-    auxModeButton->setTooltip("Banked aux mode: accel sweep (1 axis/packet, echo de-interleave). "
-                              "Toggling while acquiring exercises the live standby-bank swap");
+    auxModeButton->setTooltip("Accel sweep (1 axis/packet, intra-packet echo de-interleave). "
+                              "Pressing while acquiring reloads it via the live standby-bank swap");
     addAndMakeVisible(auxModeButton.get());
     auxModeButton->setEnabledState(false);
 
     fastSettleActive = false;
-    auxModeActive = false;
+    auxModeActive = true;   // the board boots into the accel sweep
 
     // Sample rate interface
     sampleRateInterface = std::make_unique<SampleRateInterface>(node);
