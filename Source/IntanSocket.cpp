@@ -566,8 +566,9 @@ bool IntanSocket::stopAcquisition()
     if (isThreadRunning())
     {
         signalThreadShouldExit();
+        queueCv_.notify_all();   // wake updateBuffer() if it's blocked so run() exits now
     }
-    
+
     if (intanInterface)
     {
         intanInterface->stopAcquisition();
@@ -583,8 +584,8 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
 {
     // Called from IntanInterface's UDP thread
     // Queue the packet for processing in updateBuffer()
-    
-    std::lock_guard<std::mutex> lock(queueMutex);
+
+    std::unique_lock<std::mutex> lock(queueMutex);
 
     if (dataQueue.size() >= kMaxDataQueue) {
         // Consumer fell behind -> drop the OLDEST and count it, rather than grow
@@ -610,6 +611,8 @@ void IntanSocket::processDataPacket(const uint32_t* data, size_t wordCount, uint
     packet.timestamp = timestamp;
 
     dataQueue.push(std::move(packet));   // move, not copy
+    lock.unlock();
+    queueCv_.notify_one();               // wake the (blocked) DataThread
 }
 
 bool IntanSocket::updateBuffer()
@@ -650,6 +653,18 @@ bool IntanSocket::updateBuffer()
             std::cout << std::endl;
             lastDrops = d;
         }
+    }
+
+    // BLOCK (bounded) until a packet is queued instead of returning immediately. The OE
+    // DataThread::run() loop calls updateBuffer() with NO sleep, so a fast return on an
+    // empty queue spins a whole CPU core -- self-inflicted load that starves the recv/
+    // kernel path (net.py blocks on recv and uses ~1/4 the CPU). The 100 ms cap lets
+    // run() still poll threadShouldExit() promptly.
+    {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        if (dataQueue.empty() && !hasError)
+            queueCv_.wait_for(lock, std::chrono::milliseconds(100),
+                              [this] { return !dataQueue.empty() || hasError || threadShouldExit(); });
     }
 
     // Drain EVERY queued packet this call so the dataQueue can never build a standing

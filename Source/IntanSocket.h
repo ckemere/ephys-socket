@@ -5,6 +5,7 @@
 #include "IntanInterface.h"
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <queue>
 
 namespace IntanSocketNode
@@ -183,6 +184,13 @@ private:
     };
     std::queue<DataPacket> dataQueue;
     std::mutex queueMutex;
+    // Signalled by the producer (processDataPacket) when a packet is queued, so the
+    // OpenEphys DataThread can BLOCK in updateBuffer() instead of spinning. The base
+    // DataThread::run() calls updateBuffer() in a tight no-sleep loop; returning
+    // immediately on an empty queue burns a whole CPU core (that self-inflicted load
+    // is what starves the recv/kernel path -- net.py, which blocks on recv, uses ~1/4
+    // the CPU this plugin did).
+    std::condition_variable queueCv_;
     // Bounded safety valve: dataQueue was unbounded, so if the Open Ephys consumer
     // ever fell behind it grew without limit -> memory bloat -> allocator latency
     // -> recv/demux stalls -> kernel UDP drops (SEQ gaps) after minutes. Cap it and
