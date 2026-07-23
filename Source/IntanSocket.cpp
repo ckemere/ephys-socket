@@ -1,8 +1,41 @@
 #include "IntanSocket.h"
 #include "IntanSocketEditor.h"
-#include "AppNap.h"
 
 #include <sstream>
+
+#ifdef __APPLE__
+// Disable macOS App Nap for this (plugin-container) process so the OS doesn't throttle
+// it a few seconds into acquisition and starve the UDP recv thread (packet loss that
+// starts ~10 s in). Done through the Obj-C runtime directly -- no .mm file, no
+// Foundation link -- so it can't affect whether the bundle loads. Equivalent to:
+//   token = [[[NSProcessInfo processInfo] beginActivityWithOptions:opts reason:@"…"] retain];
+#include <objc/objc.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+static void disableAppNap()
+{
+    static id token = nullptr;
+    if (token != nullptr)
+        return;                                  // already active for this process
+    Class piClass  = objc_getClass("NSProcessInfo");
+    Class strClass = objc_getClass("NSString");
+    if (piClass == nullptr || strClass == nullptr)
+        return;
+    auto msgClsSel    = reinterpret_cast<id(*)(Class, SEL)>(objc_msgSend);
+    auto msgClsSelStr = reinterpret_cast<id(*)(Class, SEL, const char*)>(objc_msgSend);
+    auto msgObjSel    = reinterpret_cast<id(*)(id, SEL)>(objc_msgSend);
+    auto msgActivity  = reinterpret_cast<id(*)(id, SEL, unsigned long long, id)>(objc_msgSend);
+    id reason = msgClsSelStr(strClass, sel_registerName("stringWithUTF8String:"),
+                             "ephys-socket real-time UDP acquisition");
+    id pi = msgClsSel(piClass, sel_registerName("processInfo"));
+    // NSActivityUserInitiated (0x00FFFFFF) | NSActivityLatencyCritical (0xFF00000000).
+    const unsigned long long opts = 0x00FFFFFFULL | 0xFF00000000ULL;
+    id activity = msgActivity(pi, sel_registerName("beginActivityWithOptions:reason:"), opts, reason);
+    token = msgObjSel(activity, sel_registerName("retain"));   // keep the activity alive
+    std::cout << "[ephys-socket] App Nap disabled for acquisition (NSActivityLatencyCritical)"
+              << std::endl;
+}
+#endif
 
 using namespace IntanSocketNode;
 

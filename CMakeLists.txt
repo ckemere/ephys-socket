@@ -37,12 +37,6 @@ set_property(DIRECTORY APPEND PROPERTY COMPILE_DEFINITIONS
 
 set(SOURCE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Source)
 file(GLOB_RECURSE SRC_FILES LIST_DIRECTORIES false "${SOURCE_PATH}/*.cpp" "${SOURCE_PATH}/*.h")
-# Objective-C++ shims (e.g. AppNap.mm) are macOS-only; exclude them elsewhere so the
-# Linux/Windows builds don't try to compile Obj-C++.
-if(APPLE)
-	file(GLOB_RECURSE MM_FILES LIST_DIRECTORIES false "${SOURCE_PATH}/*.mm")
-	list(APPEND SRC_FILES ${MM_FILES})
-endif()
 set(GUI_COMMONLIB_DIR ${GUI_BASE_DIR}/installed_libs)
 
 set(CONFIGURATION_FOLDER $<$<CONFIG:Debug>:Debug>$<$<NOT:$<CONFIG:Debug>>:Release>)
@@ -90,7 +84,7 @@ elseif(LINUX)
 elseif(APPLE)
 	set_target_properties(${PLUGIN_NAME} PROPERTIES BUNDLE TRUE)
 	set_property(TARGET ${PLUGIN_NAME} APPEND_STRING PROPERTY LINK_FLAGS
-	"-undefined dynamic_lookup -framework Foundation -rpath @loader_path/../../../../shared-api10")
+	"-undefined dynamic_lookup -rpath @loader_path/../../../../shared-api10")
 
 	install(TARGETS ${PLUGIN_NAME} DESTINATION $ENV{HOME}/Library/Application\ Support/open-ephys/plugins-api10)
 endif()
