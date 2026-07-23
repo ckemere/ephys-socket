@@ -1,5 +1,6 @@
 #include "IntanSocket.h"
 #include "IntanSocketEditor.h"
+#include "AppNap.h"
 
 #include <sstream>
 
@@ -463,6 +464,12 @@ bool IntanSocket::startAcquisition()
         LOGE("Cannot start acquisition - device not ready");
         return false;
     }
+
+#ifdef __APPLE__
+    // Keep macOS from App-Napping the plugin-container process a few seconds in and
+    // starving the UDP recv thread (loss that starts ~10 s into acquisition).
+    disableAppNap();
+#endif
     
     // Resize buffers - ONE time sample per packet across all channels
     convbuf.resize(num_channels);      // one time sample per channel
