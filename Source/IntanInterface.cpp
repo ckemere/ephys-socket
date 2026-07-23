@@ -1237,13 +1237,19 @@ public:
         // Thread-local buffer pools so the recv hot path never mallocs and never locks
         // per datagram: `spare` = recycled empty buffers to fill, `batch` = filled
         // datagrams to publish. Refilled from the demux-returned free-list in bulk.
-        std::vector<std::vector<uint8_t>> spare;
-        std::vector<std::vector<uint8_t>> batch;
+        std::vector<Datagram> spare;
+        std::vector<Datagram> batch;
         spare.reserve(kMaxRecvBatch);
         batch.reserve(kMaxRecvBatch);
-        auto takeBuf = [&]() -> std::vector<uint8_t> {
-            if (!spare.empty()) { auto b = std::move(spare.back()); spare.pop_back(); return b; }
-            return std::vector<uint8_t>();
+        // Hand back a buffer whose `bytes` is sized to kDatagramCap. Recycled buffers
+        // are already that size, so this resize is a no-op (no zero-fill); only a
+        // freshly default-constructed Datagram pays the one-time grow.
+        auto takeBuf = [&]() -> Datagram {
+            Datagram d;
+            if (!spare.empty()) { d = std::move(spare.back()); spare.pop_back(); }
+            if (d.bytes.size() != kDatagramCap) d.bytes.resize(kDatagramCap);
+            d.len = 0;
+            return d;
         };
 
         while (running_.load()) {
@@ -1251,35 +1257,34 @@ public:
             socklen_t senderLen = sizeof(senderAddr);
 
             // (1) BLOCKING recv for the first datagram of the chunk. SO_RCVTIMEO makes
-            //     this return ~once/sec when idle so we can re-check running_.
-            std::vector<uint8_t> buffer = takeBuf();
-            buffer.resize(4096);
-            int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.data()),
-                                    buffer.size(), 0,
+            //     this return ~once/sec when idle so we can re-check running_. recvfrom
+            //     into the fixed kDatagramCap buffer; record the length, never resize.
+            Datagram buffer = takeBuf();
+            int received = recvfrom(udpSocket_, reinterpret_cast<char*>(buffer.bytes.data()),
+                                    kDatagramCap, 0,
                                     reinterpret_cast<struct sockaddr*>(&senderAddr),
                                     &senderLen);
             if (received <= 0) {          // timeout / error
                 spare.push_back(std::move(buffer));
                 continue;
             }
-            buffer.resize((size_t)received);
+            buffer.len = (size_t)received;
             batch.push_back(std::move(buffer));
 
             // (2) Drain every OTHER datagram already queued in the socket WITHOUT
             //     blocking -- this is the chunk. After a scheduling gap the whole
             //     backlog comes out in one pass (catch-up), capped at kMaxRecvBatch.
             while (batch.size() < kMaxRecvBatch) {
-                std::vector<uint8_t> b = takeBuf();
-                b.resize(4096);
-                int m = recvfrom(udpSocket_, reinterpret_cast<char*>(b.data()),
-                                 b.size(), MSG_DONTWAIT,
+                Datagram b = takeBuf();
+                int m = recvfrom(udpSocket_, reinterpret_cast<char*>(b.bytes.data()),
+                                 kDatagramCap, MSG_DONTWAIT,
                                  reinterpret_cast<struct sockaddr*>(&senderAddr),
                                  &senderLen);
                 if (m <= 0) {             // EAGAIN/EWOULDBLOCK: nothing more queued now
                     spare.push_back(std::move(b));
                     break;
                 }
-                b.resize((size_t)m);
+                b.len = (size_t)m;
                 batch.push_back(std::move(b));
             }
 
@@ -1311,7 +1316,7 @@ public:
         raiseThreadPriority();
         auto lastDropLog = std::chrono::steady_clock::now();
         uint64_t lastRingDrops = 0;
-        std::vector<std::vector<uint8_t>> localBatch;   // whole ring drained per wakeup
+        std::vector<Datagram> localBatch;   // whole ring drained per wakeup
         localBatch.reserve(kMaxRecvBatch);
         while (running_.load()) {
             {
@@ -1328,7 +1333,7 @@ public:
             if (!localBatch.empty()) {
                 // Decode the chunk OUTSIDE the lock so the recv thread keeps publishing.
                 for (auto& d : localBatch)
-                    demuxDatagram(d.data(), d.size());
+                    demuxDatagram(d.bytes.data(), d.len);
                 // Return the buffers to the free-list in bulk (one lock).
                 std::lock_guard<std::mutex> lock(ringMutex_);
                 for (auto& d : localBatch)
@@ -1359,14 +1364,14 @@ public:
         }
         // Drain anything still queued at shutdown so we don't silently lose it.
         for (;;) {
-            std::vector<uint8_t> datagram;
+            Datagram datagram;
             {
                 std::lock_guard<std::mutex> lock(ringMutex_);
                 if (ring_.empty()) break;
                 datagram = std::move(ring_.front());
                 ring_.pop_front();
             }
-            demuxDatagram(datagram.data(), datagram.size());
+            demuxDatagram(datagram.bytes.data(), datagram.len);
         }
     }
 
@@ -1812,7 +1817,20 @@ public:
     // amortizes the per-datagram lock/notify overhead ~256x and lets the recv thread
     // catch up after a scheduling gap (bigger backlog -> bigger chunk). Tunable.
     static constexpr size_t kMaxRecvBatch = 256;
-    std::deque<std::vector<uint8_t>> ring_;
+    // One received datagram. `bytes` is kept PERMANENTLY at kDatagramCap so the recv
+    // hot path never re-grows/zero-fills it: the old code did buffer.resize(4096) then
+    // buffer.resize(received) per datagram, so every recycled buffer was re-zeroed
+    // (~3.5 KB) and destruct-walked back down 30k times/s -- a `sample` profile showed
+    // that churn burning ~42% of a core ON THE RECV THREAD, stealing exactly the time
+    // it needed to drain SO_RCVBUF (the kernel UDP overflow that caused the SEQ gaps,
+    // and independent of any GUI load). `len` carries the real payload length that
+    // recvfrom returned, so consumers pass (bytes.data(), len) and never touch size().
+    static constexpr size_t kDatagramCap = 4096;
+    struct Datagram {
+        std::vector<uint8_t> bytes;   // size() stays == kDatagramCap after first use
+        size_t len = 0;               // actual payload length from recvfrom
+    };
+    std::deque<Datagram> ring_;
     std::mutex ringMutex_;
     std::condition_variable ringCv_;
     uint64_t ringDrops_ = 0;
@@ -1821,7 +1839,7 @@ public:
     // matters). demuxThread_ returns each consumed buffer here; recvThread_ reuses
     // it. Guarded by ringMutex_; capped so it can't grow with the ring.
     static constexpr size_t kFreeListMax = 1024;   // ~4 MB of recycled 4 KB buffers
-    std::deque<std::vector<uint8_t>> recvFreeList_;
+    std::deque<Datagram> recvFreeList_;
 
     // State
     uint8_t currentChannelEnable_;
